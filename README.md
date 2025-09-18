@@ -237,7 +237,7 @@ Use the project’s virtual environment (`env\Scripts\activate`) before running 
 
 ## 📄 License
 
-MIT (suggested). Update `LICENSE` to your preference.
+Apache-2.0 license
 
 ---
 
