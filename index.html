@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Curia-logica</title>
+  <link rel="icon" href="/favicon.ico">
+  <style>
+    /* No page scroll; panels manage their own scrolling */
+    html, body { height: 100%; overflow: hidden; }
+    * { margin:0; padding:0; box-sizing:border-box; }
+
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial;
+      line-height: 1.6;
+      color: #e9eef6;
+      background: radial-gradient(1200px 800px at 10% 10%, #1f2a44 0%, transparent 60%),
+                  radial-gradient(1200px 800px at 90% 0%, #0f253e 0%, #0b1221 60%);
+    }
+
+    /* App layout: header (auto) + content (1fr) */
+    .viewport {
+      height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 16px 24px 20px;
+      width: 100%;
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto 1fr; /* header + content */
+      gap: 12px;
+      min-height: 0; /* allow child overflow areas */
+    }
+
+    .header {
+      display:flex; align-items:center; justify-content:space-between;
+      min-height: 56px;
+    }
+    .title { display:flex; align-items:center; gap:12px; }
+    .title h1 { font-size: 1.4rem; }
+    .pill { padding:4px 10px; background:#16324f; border:1px solid #2a4d74; border-radius:999px; font-size:.8rem; opacity:.9 }
+
+    /* Main area: 2 columns; IMPORTANT: min-height:0 so children can scroll */
+    .content {
+      display:grid;
+      grid-template-columns: 380px 1fr;
+      gap: 16px;
+      min-height: 0;
+      height: 100%;
+    }
+
+    .card {
+      background: rgba(22, 28, 45, 0.9);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 14px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.35);
+      display:flex;
+      flex-direction: column;
+      min-height: 0; /* critical for inner scroll */
+    }
+
+    .card h3 {
+      padding: 12px 16px; border-bottom:1px solid rgba(255,255,255,0.06);
+      font-size:1.0rem; opacity:.95;
+      flex: 0 0 auto;
+    }
+
+    /* LEFT: scrollable body; sticky actions at bottom */
+    .left-body {
+      padding: 14px 16px;
+      display:flex;
+      flex-direction: column;
+      gap: 12px;
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;               /* ✅ left side scrolls */
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    label { display:block; font-weight:600; margin-bottom:6px; color:#cfe1ff; }
+    select, input[type="password"] {
+      width: 100%; padding: 12px 12px;
+      border-radius: 10px; border:1px solid #334155;
+      background: #0f172a; color:#e5e7eb; outline:none;
+    }
+
+    .file-zone {
+      border: 2px dashed rgba(255,255,255,0.18);
+      background: rgba(15, 23, 42, 0.6);
+      padding: 16px;
+      border-radius: 12px;
+      text-align: center; color:#bcd1e8;
+      cursor: pointer;
+    }
+
+    .chips {
+      display:flex; flex-wrap:wrap; gap:8px; margin-top: 10px;
+      max-height: 160px; overflow: auto;    /* prevent tall lists from pushing buttons */
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .chip { display:flex; align-items:center; gap:6px;
+      background:#0b1221; border:1px solid #2a3a57; border-radius:999px; padding:6px 10px; }
+    .chip img { width:18px; height:18px; border-radius:4px }
+    .chip button { border:none; background:transparent; color:#9fb3c8; cursor:pointer; font-size:1rem; }
+
+    .api-row { display:flex; gap:8px; align-items:center; }
+
+    .btn {
+      padding: 10px 14px; border-radius: 10px;
+      border:1px solid #2a4d74; background: linear-gradient(90deg,#00c6ff,#0072ff);
+      color:white; font-weight:700; cursor:pointer;
+      box-shadow: 0 8px 24px rgba(0,114,255,0.35);
+    }
+    .btn.secondary { background:none; border-color:#334155; box-shadow:none; color:#d3e3ff; }
+
+    .progress { height: 8px; background:#0b1221; border-radius: 99px; overflow:hidden; margin-top: 8px; }
+    .progress > div { height: 100%; width: 0%; background: linear-gradient(90deg,#00c6ff,#4ade80); transition: width .2s }
+
+    .actions {
+      position: sticky; bottom: 0;      /* ✅ keeps buttons fixed at bottom of left panel */
+      padding-top: 10px;
+      background: linear-gradient(to top, rgba(22,28,45,1) 70%, rgba(22,28,45,0));
+      display:flex; gap:8px;
+      flex: 0 0 auto;
+    }
+
+    /* RIGHT: results (only this scrolls vertically) */
+    .results-wrap {
+      display:flex; flex-direction: column;
+      height: 100%; min-height: 0;
+    }
+
+    .results-toolbar {
+      position: sticky; top: 0; z-index: 10;
+      background: rgba(22,28,45,0.98);
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      padding: 10px 16px;
+      display:flex; gap: 8px; align-items: center; justify-content: flex-end;
+      flex: 0 0 auto;
+    }
+
+    .results {
+      padding: 12px 16px 16px;
+      overflow-y: auto;                 /* ✅ results scroll here */
+      overflow-x: hidden;
+      flex: 1 1 auto; min-height: 0;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .result-item {
+      background:#0b1221; border:1px solid #253753; border-left:4px solid #00c6ff;
+      padding:12px; border-radius:10px; margin: 12px 0;
+    }
+    .result-item h4 { margin-bottom:6px }
+    .result-item img { max-width:100%; border-radius:10px; margin-top:8px }
+    .code { background:#0b1221; border:1px solid #1e293b; padding:12px; border-radius:10px; overflow:auto }
+
+    .toast {
+      position: fixed; right: 16px; bottom: 16px;
+      background:#10233a; border:1px solid #1f3a5f; padding:10px 14px; border-radius:10px;
+      display:none
+    }
+
+    /* Loading animation */
+    .spinner {
+      width: 32px; height: 32px; border-radius: 50%;
+      border: 3px solid rgba(255,255,255,0.2);
+      border-top-color: #00c6ff;
+      animation: spin 0.9s linear infinite;
+      margin-right: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .loading {
+      display:flex; align-items:center; gap:10px;
+      padding: 12px; background:#0b1221; border:1px dashed #2a4d74; border-radius:10px;
+      color:#cfe1ff; font-weight:600;
+    }
+  </style>
+</head>
+<body>
+  <div class="viewport">
+    <div class="container">
+      <div class="header">
+        <div class="title">
+          <img src="/favicon.ico" alt="app" width="28" height="28"/>
+          <h1>Curia-logica</h1>
+          <h4 font="0.8rem">An analytic curia for modern data.</h4>
+          <span class="pill">Multi-Provider</span>
+        </div>
+      </div>
+
+      <div class="content">
+        <!-- LEFT: scrollable controls with sticky actions -->
+        <div class="card">
+          <h3>Setup</h3>
+          <div class="left-body">
+            <div class="grid-2">
+              <div>
+                <label for="provider">LLM Provider</label>
+                <select id="provider">
+                  <option value="gemini">Gemini (Google)</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="claude">Claude (Anthropic)</option>
+                </select>
+              </div>
+              <div>
+                <label for="model">Model</label>
+                <select id="model"></select>
+              </div>
+            </div>
+
+            <div>
+              <label for="apiKey">API Key</label>
+              <div class="api-row">
+                <input id="apiKey" type="password" placeholder="Enter API key (kept in browser only)"/>
+                <button id="toggleKey" class="btn secondary" style="white-space:nowrap">Show</button>
+              </div>
+              <p style="color:#9fb3c8; margin-top:6px">We do not store your key. It is sent only with your current request.</p>
+            </div>
+
+            <div>
+              <label for="questions_file">Questions File (.txt) <span style="color:#ff758f">*</span></label>
+              <div id="qZone" class="file-zone">Drop .txt here or click</div>
+              <input id="questions_file" type="file" accept=".txt" style="display:none"/>
+              <div id="qChips" class="chips"></div>
+            </div>
+
+            <div>
+              <label for="data_file">Dataset (optional)</label>
+              <div id="dZone" class="file-zone">Drop .csv/.xlsx/.json/.parquet/.pdf/.png/.jpg here or click</div>
+              <input id="data_file" type="file" accept=".csv,.xlsx,.xls,.json,.parquet,.png,.jpeg,.jpg,.pdf,.db,.duckdb,.tar.gz,.tgz,.tar,.zip" style="display:none"/>
+              <div id="dChips" class="chips"></div>
+            </div>
+
+            <div class="actions">
+              <button id="run" class="btn" style="flex:1">🚀 Run Analysis</button>
+              <button id="clear" class="btn secondary" style="flex:1">🧹 Clear</button>
+            </div>
+
+            <div class="progress"><div id="bar"></div></div>
+          </div>
+        </div>
+
+        <!-- RIGHT: scrollable results -->
+        <div class="card">
+          <h3>Results</h3>
+          <div class="results-wrap">
+            <div class="results-toolbar">
+              <button id="copyJSON" class="btn secondary">Copy JSON</button>
+              <button id="saveJSON" class="btn secondary">Save JSON</button>
+            </div>
+            <div class="results" id="results"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+<script>
+/* Models */
+const PROVIDER_MODELS = {
+  gemini: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+  openai: ["gpt-4o-mini", "gpt-4o", "o3-mini"],
+  claude: ["claude-3-7-sonnet", "claude-3-5-sonnet", "claude-3-5-haiku"]
+};
+
+const el = (id) => document.getElementById(id);
+const providerSel = el("provider");
+const modelSel = el("model");
+const apiKey = el("apiKey");
+const toggleKey = el("toggleKey");
+const qZone = el("qZone");
+const qInput = el("questions_file");
+const qChips = el("qChips");
+const dZone = el("dZone");
+const dInput = el("data_file");
+const dChips = el("dChips");
+const results = el("results");
+const bar = el("bar");
+const toast = el("toast");
+const copyJSON = el("copyJSON");
+const saveJSON = el("saveJSON");
+
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.style.display = "block";
+  setTimeout(() => { toast.style.display = "none"; }, 2500);
+}
+
+function setModelsFor(provider) {
+  modelSel.innerHTML = "";
+  (PROVIDER_MODELS[provider] || []).forEach((m, i) => {
+    const opt = document.createElement("option");
+    opt.value = m; opt.textContent = m ;
+    modelSel.appendChild(opt);
+  });
+}
+setModelsFor(providerSel.value);
+providerSel.addEventListener("change", () => setModelsFor(providerSel.value));
+
+toggleKey.addEventListener("click", (e) => {
+  e.preventDefault();
+  apiKey.type = apiKey.type === "password" ? "text" : "password";
+  toggleKey.textContent = apiKey.type === "password" ? "Show" : "Hide";
+});
+
+function attachZone(zone, input, chips) {
+  zone.addEventListener("click", () => input.click());
+  zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.style.borderColor = "#00c6ff"; });
+  zone.addEventListener("dragleave", () => { zone.style.borderColor = "rgba(255,255,255,0.18)"; });
+  zone.addEventListener("drop", (e) => {
+    e.preventDefault(); zone.style.borderColor = "rgba(255,255,255,0.18)";
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      input.files = e.dataTransfer.files;
+      renderChip(input, chips);
+    }
+  });
+  input.addEventListener("change", () => renderChip(input, chips));
+}
+
+function renderChip(input, chips) {
+  chips.innerHTML = "";
+  const file = input.files[0];
+  if (!file) return;
+  const chip = document.createElement("div");
+  chip.className = "chip";
+  const icon = document.createElement("img");
+  icon.src = "/favicon.ico";
+  const span = document.createElement("span");
+  span.textContent = file.name + " (" + (file.size/1024).toFixed(1) + " KB)";
+  const btn = document.createElement("button");
+  btn.textContent = "✕";
+  btn.onclick = () => { input.value = ""; chips.innerHTML = ""; };
+  chip.appendChild(icon); chip.appendChild(span); chip.appendChild(btn);
+  chips.appendChild(chip);
+
+  if (/(\.png|\.jpg|\.jpeg)$/i.test(file.name)) {
+    const img = document.createElement("img");
+    img.style.maxWidth = "90px"; img.style.borderRadius = "8px"; img.style.marginLeft = "6px";
+    const r = new FileReader();
+    r.onload = () => { img.src = r.result; };
+    r.readAsDataURL(file);
+    chip.appendChild(img);
+  }
+}
+
+attachZone(qZone, qInput, qChips);
+attachZone(dZone, dInput, dChips);
+
+function setProgress(p) { bar.style.width = Math.min(100, Math.max(0, p)) + "%"; }
+
+/* Loading view */
+function showLoading() {
+  results.innerHTML = `
+    <div class="loading">
+      <div class="spinner" align="center"></div>
+      <div>Analyzing...</div>
+    </div>
+  `;
+  results.scrollTop = 0;  // ensure starts at top
+}
+
+function displayResults(obj) {
+  results.innerHTML = "";
+  Object.entries(obj).forEach(([k,v]) => {
+    const item = document.createElement("div");
+    item.className = "result-item";
+    const title = document.createElement("h4");
+    title.textContent = k;
+    const content = document.createElement("div");
+
+    let s = null;
+    if (typeof v === "string") s = v.trim();
+    else if (v && typeof v === "object") {
+      s = v.image || v.base64 || v.plot || v.data || null;
+      if (typeof s === "string") s = s.trim();
+    }
+    if (s) {
+      s = s.replace(/^data:aimage\//i, 'data:image/');
+      const base64Like = /^[A-Za-z0-9+/=\r\n]+$/.test(s) && s.length > 200 && !/\s{2,}/.test(s);
+      if (/^data:image\//i.test(s) || base64Like) {
+        const img = document.createElement("img");
+        img.src = /^data:image\//i.test(s) ? s : "data:image/png;base64," + s;
+        content.appendChild(img);
+      } else {
+        const pre = document.createElement("pre");
+        pre.className = "code";
+        pre.textContent = JSON.stringify(v, null, 2);
+        content.appendChild(pre);
+      }
+    } else {
+      const pre = document.createElement("pre");
+      pre.className = "code";
+      pre.textContent = typeof v === "string" ? v : JSON.stringify(v, null, 2);
+      content.appendChild(pre);
+    }
+    item.appendChild(title);
+    item.appendChild(content);
+    results.appendChild(item);
+  });
+}
+
+async function run() {
+  if (!qInput.files[0]) { toast.textContent="Please attach a .txt questions file."; toast.style.display="block"; setTimeout(()=>toast.style.display="none",2000); return; }
+
+  setProgress(10);
+  showLoading();
+
+  const fd = new FormData();
+  fd.append("provider", providerSel.value);
+  fd.append("model", modelSel.value);
+  fd.append("api_key", apiKey.value);
+  fd.append("questions_file", qInput.files[0]);
+  if (dInput.files[0]) fd.append("data_file", dInput.files[0]);
+
+  try {
+    setProgress(35);
+    const resp = await fetch("/api", { method:"POST", body: fd });
+    setProgress(65);
+    if (!resp.ok) {
+      let msg = "HTTP " + resp.status;
+      try { const err = await resp.json(); if (err && err.detail) msg = err.detail; } catch {}
+      throw new Error(msg);
+    }
+    const data = await resp.json();
+    setProgress(100);
+    displayResults(data);
+    window.__lastJSON = data;
+    toast.textContent="Done"; toast.style.display="block"; setTimeout(()=>toast.style.display="none",2000);
+  } catch (e) {
+    results.innerHTML = '<div class="result-item"><h4>❌ Error</h4><div>'+ (e.message || "Unknown error") +'</div></div>';
+    toast.textContent="Error"; toast.style.display="block"; setTimeout(()=>toast.style.display="none",2000);
+    setProgress(0);
+  }
+}
+
+document.getElementById("run").addEventListener("click", run);
+document.getElementById("clear").addEventListener("click", () => {
+  qInput.value = ""; dInput.value = "";
+  qChips.innerHTML = ""; dChips.innerHTML = "";
+  results.innerHTML = ""; setProgress(0);
+});
+copyJSON.addEventListener("click", async () => {
+  if (!window.__lastJSON) return;
+  await navigator.clipboard.writeText(JSON.stringify(window.__lastJSON, null, 2));
+  toast.textContent="Copied JSON"; toast.style.display="block"; setTimeout(()=>toast.style.display="none",2000);
+});
+saveJSON.addEventListener("click", () => {
+  if (!window.__lastJSON) return;
+  const blob = new Blob([JSON.stringify(window.__lastJSON, null, 2)], {type:"application/json"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "results.json"; a.click();
+  URL.revokeObjectURL(url);
+});
+
+/* Initialize models */
+(function initModels(){ setModelsFor(providerSel.value); })();
+</script>
+</body>
+</html>
