@@ -4,24 +4,12 @@ python-multipart
 python-dotenv
 requests
 
-pandas
-numpy
-matplotlib
-openpyxl
-pyarrow
 duckdb
-
 beautifulsoup4
 lxml
 pillow
+openpyxl
 
-langchain
-langchain-core
-langchain-google-genai
 google-generativeai
-langchain-openai
 openai
-langchain-anthropic
 anthropic
-
-PyMuPDF
