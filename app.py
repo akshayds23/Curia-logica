@@ -96,9 +96,13 @@ async def serve_frontend():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 # ---------------------------------------------------------------------
-# Helpers: JSON extraction
+# Helpers: Robust JSON extraction + validation + retry prompting
 # ---------------------------------------------------------------------
 def clean_llm_json(output: str) -> Dict[str, Any]:
+    """
+    Robustly extract the FIRST valid JSON object from any LLM text.
+    Handles cases where model prints extra text before/after JSON.
+    """
     if not output:
         return {"error": "Empty LLM output"}
 
@@ -106,16 +110,67 @@ def clean_llm_json(output: str) -> Dict[str, Any]:
     s = re.sub(r"^```(?:json)?\s*", "", s)
     s = re.sub(r"\s*```$", "", s)
 
-    first = s.find("{")
-    last = s.rfind("}")
-    if first == -1 or last == -1 or last <= first:
+    start = s.find("{")
+    if start == -1:
         return {"error": "No JSON object found in LLM output", "raw": s}
 
-    candidate = s[first:last + 1]
-    try:
-        return json.loads(candidate)
-    except Exception as e:
-        return {"error": f"JSON parse failed: {e}", "raw": candidate}
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except Exception as e:
+                        return {"error": f"JSON parse failed: {e}", "raw": candidate}
+
+    return {"error": "Unbalanced JSON braces in LLM output", "raw": s[start:]}
+
+
+def validate_llm_payload(obj: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(obj, dict):
+        return "Top-level is not an object."
+    if "keys" not in obj or "code" not in obj:
+        return "Missing required fields 'keys' and/or 'code'."
+    if not isinstance(obj["keys"], list) or not all(isinstance(k, str) for k in obj["keys"]):
+        return "'keys' must be a list of strings."
+    if not isinstance(obj["code"], str) or not obj["code"].strip():
+        return "'code' must be a non-empty string."
+    return None
+
+
+def make_fix_format_prompt(reason: str, raw_bad_output: str = "") -> str:
+    # Keep it short and strict; do not paste huge raw output by default (token safety)
+    # If you want, you can include a truncated snippet.
+    snippet = (raw_bad_output or "").strip()
+    if len(snippet) > 1200:
+        snippet = snippet[:1200] + " ...[truncated]"
+
+    return (
+        "FORMAT ERROR. You MUST return ONLY a single JSON object and NOTHING ELSE.\n"
+        "No explanations. No markdown. No comments. No code outside JSON.\n\n"
+        "Required JSON schema:\n"
+        "{\"keys\":[\"...\"],\"code\":\"...\"}\n\n"
+        f"Reason last response was rejected: {reason}\n"
+        + (f"\nLast response snippet:\n{snippet}\n" if snippet else "\n")
+        + "Now return the corrected JSON ONLY."
+    )
 
 # ---------------------------------------------------------------------
 # OCR.space (PDF/JPG/PNG) -> text
@@ -151,6 +206,7 @@ def ocr_space_extract_text(file_bytes: bytes, filename: str) -> str:
 
     return "\n".join(text_parts).strip()
 
+
 def lines_to_table_rows(lines: List[str]) -> Optional[List[List[str]]]:
     rows: List[List[str]] = []
     for line in lines:
@@ -177,6 +233,7 @@ def lines_to_table_rows(lines: List[str]) -> Optional[List[List[str]]]:
         return None
 
     return filtered
+
 
 def write_rows_to_csv(rows: List[List[str]]) -> str:
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="")
@@ -236,6 +293,7 @@ def save_upload_to_temp(content: bytes, suffix: str) -> str:
     tmp.close()
     return tmp.name
 
+
 def xlsx_to_csv_temp(xlsx_path: str) -> str:
     if not HAS_OPENPYXL:
         raise HTTPException(400, "openpyxl is required to read .xlsx files (add it to requirements).")
@@ -254,6 +312,7 @@ def xlsx_to_csv_temp(xlsx_path: str) -> str:
     out.flush()
     out.close()
     return out_path
+
 
 def duckdb_load_table(
     conn: duckdb.DuckDBPyConnection,
@@ -300,6 +359,7 @@ def duckdb_load_table(
     cols = [r[0] for r in conn.execute(f"DESCRIBE {table}").fetchall()]
     preview = conn.execute(f"SELECT * FROM {table} LIMIT 5").fetchall()
     return table, cols, preview
+
 
 def format_preview_md(cols: List[str], rows: List[Tuple[Any, ...]]) -> str:
     if not cols:
@@ -377,6 +437,7 @@ def validate_provider_model(provider: str, model: str) -> None:
     if model not in allowed:
         raise HTTPException(400, f"Unsupported model '{model}' for provider '{provider}'. Allowed models: {allowed}")
 
+
 def call_openai(model: str, api_key: str, prompt: str) -> str:
     try:
         from openai import OpenAI  # type: ignore
@@ -402,6 +463,7 @@ def call_openai(model: str, api_key: str, prompt: str) -> str:
     except Exception as e:
         raise HTTPException(502, f"OpenAI API call failed: {e}")
 
+
 def call_anthropic(model: str, api_key: str, prompt: str) -> str:
     try:
         import anthropic  # type: ignore
@@ -423,6 +485,7 @@ def call_anthropic(model: str, api_key: str, prompt: str) -> str:
         return "\n".join(parts).strip()
     except Exception as e:
         raise HTTPException(502, f"Anthropic API call failed: {e}")
+
 
 def call_gemini(model: str, api_key: str, prompt: str) -> str:
     try:
@@ -451,6 +514,7 @@ def call_gemini(model: str, api_key: str, prompt: str) -> str:
     except Exception as e:
         raise HTTPException(502, f"Gemini API call failed: {e}")
 
+
 def call_llm(provider: str, model: str, api_key: str, prompt: str) -> str:
     provider = provider.lower().strip()
     validate_provider_model(provider, model)
@@ -468,9 +532,8 @@ def call_llm(provider: str, model: str, api_key: str, prompt: str) -> str:
     raise HTTPException(400, f"Unsupported provider: {provider}")
 
 # ---------------------------------------------------------------------
-# Safe execution: run generated python in a subprocess
+# Safe execution: run generated python in a subprocess (with strong hardening)
 # ---------------------------------------------------------------------
-
 EXEC_PREAMBLE = r"""
 import os, json, re, base64
 import duckdb
@@ -479,7 +542,6 @@ import requests
 DATA_PATH = os.environ.get("DATA_PATH", "")
 DATA_NAME = os.environ.get("DATA_NAME", "").lower()
 
-# Minimal keyword list for naive SQL token rewriting safety
 _SQL_KEYWORDS = {
     "select","from","where","group","by","order","limit","having","join","left","right","inner","outer","on",
     "as","and","or","not","null","is","in","like","distinct","count","sum","avg","min","max","case","when",
@@ -508,7 +570,6 @@ def scrape_url_to_tempfile(url: str) -> tuple[str, str]:
     ctype = (r.headers.get("Content-Type") or "").lower()
     lower = url.lower()
 
-    # direct file formats
     if "application/json" in ctype or lower.endswith(".json"):
         return _save_bytes(r.content, ".json"), "scraped.json"
     if "text/csv" in ctype or lower.endswith(".csv"):
@@ -516,9 +577,9 @@ def scrape_url_to_tempfile(url: str) -> tuple[str, str]:
     if "parquet" in ctype or lower.endswith(".parquet"):
         return _save_bytes(r.content, ".parquet"), "scraped.parquet"
 
-    # HTML -> first table -> CSV (fallback: text)
+    # HTML -> first table -> CSV; fallback: text
     try:
-        import csv
+        import csv, tempfile
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(r.text, "lxml")
         table = soup.find("table")
@@ -535,7 +596,6 @@ def scrape_url_to_tempfile(url: str) -> tuple[str, str]:
         if not rows:
             return _save_bytes(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
 
-        import tempfile
         out = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="")
         w = csv.writer(out)
         for row in rows:
@@ -550,7 +610,7 @@ def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDB
     conn.execute(f"DROP TABLE IF EXISTS {table}")
     name = (name or "").lower()
 
-    # Always ensure table exists, even without upload
+    # Ensure a table always exists
     if not path:
         conn.execute(f"CREATE TABLE IF NOT EXISTS {table}(text VARCHAR)")
         return conn
@@ -591,12 +651,11 @@ duckdb_conn = load_into_duckdb(DATA_PATH, DATA_NAME, table="data")
 db = duckdb_conn
 conn = duckdb_conn
 
-# Bind global duckdb.sql/query to this connection so duckdb.sql("...") sees table `data`
+# Bind duckdb.sql/query to THIS connection so duckdb.sql("...") sees `data`
 duckdb.sql = duckdb_conn.sql
 duckdb.query = duckdb_conn.sql
 
 def _norm_name(s: str) -> str:
-    # normalize a column name to snake_case-ish
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
@@ -607,13 +666,11 @@ def _norm_name(s: str) -> str:
     return s
 
 def _quote_ident(name: str) -> str:
-    # Double-quote and escape embedded quotes
     return '"' + (name or "").replace('"', '""') + '"'
 
 def build_data_norm_view(base_table: str = "data", norm_view: str = "data_norm") -> dict:
-    # Create a normalized view with safe column aliases + mapping
     cols = duckdb_conn.execute(f"DESCRIBE {base_table}").fetchall()
-    originals = [c[0] for c in cols]  # col name in 1st field
+    originals = [c[0] for c in cols]
 
     mapping = {}  # normalized -> original
     used = set()
@@ -621,7 +678,6 @@ def build_data_norm_view(base_table: str = "data", norm_view: str = "data_norm")
 
     for orig in originals:
         norm = _norm_name(orig)
-        # de-dup normalized names
         if norm in used:
             i = 2
             while f"{norm}_{i}" in used:
@@ -633,34 +689,30 @@ def build_data_norm_view(base_table: str = "data", norm_view: str = "data_norm")
 
     duckdb_conn.execute(f"DROP VIEW IF EXISTS {norm_view}")
     duckdb_conn.execute(f"CREATE VIEW {norm_view} AS SELECT {', '.join(select_parts)} FROM {base_table}")
-
     return mapping
 
 COLMAP = build_data_norm_view("data", "data_norm")  # normalized -> original
 
 def col(name: str) -> str:
-    # Return a safely-quoted original identifier if possible; otherwise quote provided.
     if not name:
         return '""'
     n = _norm_name(name)
     if n in COLMAP:
         return _quote_ident(COLMAP[n])
-    # also allow exact original match ignoring case
-    for k, v in COLMAP.items():
+    # allow matching original ignoring case
+    for _, v in COLMAP.items():
         if v.lower() == name.strip().lower():
             return _quote_ident(v)
     return _quote_ident(name.strip())
 
 def sql_fix(sql: str) -> str:
-    # General SQL sanitizer:
-    # 1) Prefer data_norm view
     s = sql
 
-    # Replace FROM/JOIN data -> data_norm (but don't break data_norm itself)
+    # Prefer normalized view by default
     s = re.sub(r"(?i)\bfrom\s+data\b", "FROM data_norm", s)
     s = re.sub(r"(?i)\bjoin\s+data\b", "JOIN data_norm", s)
 
-    # Fix SUBSTRING(col, a, b) where col might be numeric
+    # Fix substring/substr on numeric cols: cast to varchar
     s = re.sub(
         r"(?i)\bsubstring\(\s*([A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\")\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*\)",
         r"SUBSTRING(CAST(\1 AS VARCHAR), \2, \3)",
@@ -672,31 +724,24 @@ def sql_fix(sql: str) -> str:
         s,
     )
 
-    # Rewrite unquoted normalized identifiers to quoted originals when needed.
-    # This helps when the model uses Worldwide_gross but original is "Worldwide gross".
-    # We only rewrite tokens that match COLMAP keys and are NOT SQL keywords.
+    # If LLM uses normalized column names without quoting, quote them (safe)
     def repl_token(m):
         tok = m.group(0)
         low = tok.lower()
         if low in _SQL_KEYWORDS:
             return tok
-        # if token exists as normalized column in data_norm, keep it
         if low in COLMAP:
-            # In data_norm, the column is already low (normalized)
-            return _quote_ident(low)
+            return _quote_ident(low)  # data_norm has these normalized identifiers
         return tok
 
-    # Replace bare tokens in SELECT/WHERE etc (naive but effective for most LLM SQL)
     s = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", repl_token, s)
 
     return s
 
 def q(sql: str):
-    # convenience: auto-fix + execute and return cursor
     return duckdb_conn.execute(sql_fix(sql))
 
 def scrape_url_to_duckdb_table(url: str, table: str = "data") -> str:
-    # Load web data into DuckDB and rebuild data_norm.
     path, name = scrape_url_to_tempfile(url)
     name = (name or "").lower()
 
@@ -716,7 +761,6 @@ def scrape_url_to_duckdb_table(url: str, table: str = "data") -> str:
     else:
         raise RuntimeError(f"Unsupported scraped type: {name}")
 
-    # Rebuild normalized view + mapping
     global COLMAP
     COLMAP = build_data_norm_view(table, "data_norm")
     return table
@@ -731,13 +775,8 @@ BLOCKED_IMPORT_RE = re.compile(
 
 def run_user_code(code: str, data_path: str, data_name: str, timeout: int) -> Dict[str, Any]:
     if BLOCKED_IMPORT_RE.search(code or ""):
-        return {
-            "status": "error",
-            "message": "Generated code tried to import blocked libraries (pandas/numpy/matplotlib/pyarrow/seaborn).",
-        }
+        return {"status": "error", "message": "Generated code tried to import blocked libraries (pandas/numpy/matplotlib/pyarrow/seaborn)."}
 
-    # Extra safety: discourage direct duckdb.sql usage (we already bind it, but still)
-    # Also normalize common mistakes: substring casts are handled inside executor via sql_fix()
     script = EXEC_PREAMBLE + "\n\n" + (code or "") + "\n\n" + r"""
 print(json.dumps({"status":"success","result":results}, default=str), flush=True)
 """
@@ -759,10 +798,7 @@ print(json.dumps({"status":"success","result":results}, default=str), flush=True
             env=env,
         )
         if completed.returncode != 0:
-            return {
-                "status": "error",
-                "message": (completed.stderr.strip() or completed.stdout.strip() or "Unknown execution error"),
-            }
+            return {"status": "error", "message": (completed.stderr.strip() or completed.stdout.strip() or "Unknown execution error")}
 
         out = completed.stdout.strip()
         try:
@@ -787,9 +823,8 @@ print(json.dumps({"status":"success","result":results}, default=str), flush=True
 # ---------------------------------------------------------------------
 @app.get("/api/models", include_in_schema=False)
 async def list_models():
-    return JSONResponse(
-        {"providers": {"openai": OPENAI_MODELS, "anthropic": ANTHROPIC_MODELS, "gemini": GEMINI_MODELS}}
-    )
+    return JSONResponse({"providers": {"openai": OPENAI_MODELS, "anthropic": ANTHROPIC_MODELS, "gemini": GEMINI_MODELS}})
+
 
 @app.post("/api")
 async def analyze_data(request: Request):
@@ -859,61 +894,64 @@ async def analyze_data(request: Request):
             f"Columns (original): {', '.join(cols)}\n"
             f"Preview:\n{format_preview_md(cols, rows)}\n"
             "In the executor you will ALSO have a normalized view `data_norm` with snake_case columns.\n"
-            "Always query `data_norm` unless you explicitly need original names.\n"
+            "Prefer querying `data_norm`. Use helper `q(sql)` for auto-fixes.\n"
         )
 
     rules: List[str] = []
-
-    # Core invariant for all cases
-    rules.append("0) You MUST query DuckDB using `duckdb_conn.execute(...)` or helper `q(sql)`.")
-    rules.append("0b) A normalized view `data_norm` always exists; prefer it over `data`.")
-    rules.append("0c) Always start by checking schema:\n"
-                 "   - duckdb_conn.execute('DESCRIBE data').fetchall()\n"
-                 "   - duckdb_conn.execute('DESCRIBE data_norm').fetchall()")
-
+    rules.append("ABSOLUTE OUTPUT RULE: Return ONLY one JSON object. If you output anything else, the request fails.")
+    rules.append("0) Your response must be JSON ONLY: {\"keys\":[...],\"code\":\"...\"}. No markdown, no comments, no extra text.")
+    rules.append("1) In code: Use DuckDB via `duckdb_conn` (or aliases `db` / `conn`).")
+    rules.append("2) Prefer querying `data_norm` (normalized snake_case columns). Use helper `q(sql)` which auto-fixes SQL.")
+    rules.append("3) Always begin code by introspecting schema:")
+    rules.append("   - duckdb_conn.execute('DESCRIBE data').fetchall()")
+    rules.append("   - duckdb_conn.execute('DESCRIBE data_norm').fetchall()")
     if dataset_uploaded:
-        rules.append("1) A dataset is already loaded. Use table/view: `data_norm` (preferred) or `data` (original).")
-        rules.append("2) Do NOT fetch external data unless absolutely required.")
+        rules.append("4) Dataset is already loaded. Do NOT fetch external data unless required.")
     else:
-        rules.append("1) No dataset is uploaded. If you need data, you MUST call `scrape_url_to_duckdb_table(url)` first.")
-        rules.append("1b) After scraping, query `data_norm` (preferred).")
-
-    rules.append('3) Return ONLY a valid JSON object with keys: "keys" (list) and "code" (string).')
-    rules.append("4) Your Python code MUST create a dict named `results` and fill it with exactly those keys.")
-    rules.append("5) For charts, use `quickchart_to_base64(chart_config)` to return base64 PNG.")
-    rules.append("6) Keep code deterministic; define variables before use; do not print anything (results only).")
-    rules.append("7) DO NOT import or use pandas, numpy, matplotlib, seaborn, pyarrow, sklearn.")
-    rules.append("8) Prefer SQL over Python loops. Use DuckDB SQL and fetch results via fetchone()/fetchall().")
-    rules.append("9) Column name safety:")
-    rules.append("   - Prefer `data_norm` which has snake_case safe names.")
-    rules.append("   - If you must reference original columns that may have spaces, use helper `col('name')` to get a safely quoted identifier.")
-    rules.append("10) Regex/backslash safety: inside SQL strings use raw strings r'...' OR escape backslashes \\\\.")
-    rules.append("11) SUBSTRING/SUBSTR safety: always CAST to VARCHAR first; or rely on `sql_fix()` by executing via `q(sql)`.")
-    rules.append("12) Never use duckdb.read_html / read_html / pandas. Not available.")
-    rules.append("13) Use helper `q(sql)` when possible; it auto-fixes common SQL mistakes and prefers data_norm.")
+        rules.append("4) No dataset is uploaded. If you need data, you MUST call `scrape_url_to_duckdb_table(url)` first.")
+    rules.append("5) Your Python code MUST populate dict `results` with exactly the requested keys.")
+    rules.append("6) Charts: use `quickchart_to_base64(chart_config)` returning base64 PNG.")
+    rules.append("7) Do NOT import pandas/numpy/matplotlib/seaborn/pyarrow/sklearn.")
+    rules.append("8) SQL safety: if you use SUBSTRING/SUBSTR, cast to VARCHAR; or use `q(sql)` to auto-fix.")
+    rules.append("9) Column names: do NOT invent underscore names. Use `data_norm` columns; if you need original, use helper `col('name')`.")
+    rules.append("10) Regex/backslash safety in SQL strings: use raw strings r'...' or escape backslashes \\\\.")
 
     prompt = (
         "You are a full-stack autonomous data analyst.\n\n"
         + "Rules:\n" + "\n".join(rules) + "\n\n"
         + "Questions (from .txt):\n" + raw_questions + "\n"
         + (df_preview if df_preview else "") + "\n"
-        + 'Return ONLY JSON in this format:\n{"keys":["..."],"code":"..."}\n'
+        + "Return ONLY JSON in this format:\n"
+          "{\"keys\":[\"...\"],\"code\":\"...\"}\n"
     )
 
+    # --- LLM call + robust parsing + strict retry ---
     llm_out = call_llm(provider=provider, model=model, api_key=api_key, prompt=prompt)
 
     parsed = clean_llm_json(llm_out)
     if "error" in parsed:
+        fix_prompt = make_fix_format_prompt(parsed["error"], llm_out)
+        llm_out2 = call_llm(provider=provider, model=model, api_key=api_key, prompt=fix_prompt)
+        parsed = clean_llm_json(llm_out2)
+
+    if "error" in parsed:
         raise HTTPException(500, f"LLM output parsing error: {parsed.get('error')}. Raw: {parsed.get('raw')}")
 
-    if not isinstance(parsed, dict) or "code" not in parsed or "keys" not in parsed:
-        raise HTTPException(500, f"Invalid LLM response shape. Got: {parsed}")
+    reason = validate_llm_payload(parsed)
+    if reason:
+        fix_prompt = make_fix_format_prompt(reason, llm_out)
+        llm_out3 = call_llm(provider=provider, model=model, api_key=api_key, prompt=fix_prompt)
+        parsed = clean_llm_json(llm_out3)
+
+        if "error" in parsed:
+            raise HTTPException(500, f"LLM output parsing error: {parsed.get('error')}. Raw: {parsed.get('raw')}")
+
+        reason2 = validate_llm_payload(parsed)
+        if reason2:
+            raise HTTPException(500, f"LLM response invalid after retry: {reason2}")
 
     code = parsed["code"]
     keys = parsed["keys"]
-
-    if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
-        raise HTTPException(400, "LLM returned invalid `keys` (must be a list of strings).")
 
     exec_result = run_user_code(code=code, data_path=data_path, data_name=data_name, timeout=EXEC_TIMEOUT_SECONDS)
     if isinstance(exec_result, dict) and exec_result.get("status") == "error":
