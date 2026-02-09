@@ -554,6 +554,13 @@ def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDB
 
 duckdb_conn = load_into_duckdb(DATA_PATH, DATA_NAME, table="data")
 
+# Aliases to prevent NameError from LLM-generated code
+db = duckdb_conn
+conn = duckdb_conn
+
+results = {}
+
+
 def scrape_url_to_duckdb_table(url: str, table: str = "data") -> str:
     # Downloads URL and loads into DuckDB table.
     # Supports CSV/JSON/Parquet; HTML falls back to text in a one-column table.
