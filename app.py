@@ -778,7 +778,7 @@ async def analyze_data(request: Request):
     rules.append("8) Use DuckDB SQL ONLY for data manipulation.")
     rules.append("9) Use Python built-ins or DuckDB results (lists/tuples) for logic.")
     rules.append("10) When writing SQL inside Python strings: ALWAYS use raw strings r'...' OR double-escape backslashes (\\\\).")
-    rules.append("11)Before referencing any column names, first check schema:duckdb_conn.execute("DESCRIBE data").fetchall() If the table only has column 'text', you must parse/scrape structured data first.")
+    rules.append("11)Before referencing any column names, first check schema:duckdb_conn.execute('DESCRIBE data').fetchall() If the table only has column 'text', you must parse/scrape structured data first.")
     rules.append("12) Never embed tuples into SQL. `scrape_url_to_tempfile(url)` returns (path, filename) — prefer `scrape_url_to_duckdb_table(url)`.")
 
     prompt = (
