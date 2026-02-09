@@ -21,7 +21,7 @@ try:
 except Exception:
     HAS_OPENPYXL = False
 
-# Optional image handling (we only need it to validate/normalize before OCR, not for OCR itself)
+# Optional image handling (not used for OCR itself)
 try:
     from PIL import Image  # type: ignore
     HAS_PIL = True
@@ -37,13 +37,11 @@ app = FastAPI(title="Curia Logica - Data Analyst Agent (Serverless-friendly)")
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "180"))
 EXEC_TIMEOUT_SECONDS = int(os.getenv("EXEC_TIMEOUT_SECONDS", "120"))
 
-# OCR.space key MUST be set in Vercel env for OCR features
 OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "").strip()
 
 # ---------------------------------------------------------------------
 # Model allow-lists (no defaults; user must pick one)
 # ---------------------------------------------------------------------
-
 OPENAI_MODELS: List[str] = [
     "gpt-5.2",
     "gpt-5.2-pro",
@@ -96,13 +94,9 @@ async def serve_frontend():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 # ---------------------------------------------------------------------
-# Helpers: Robust JSON extraction + validation + retry prompting
+# Robust JSON extraction + validation + retry
 # ---------------------------------------------------------------------
 def clean_llm_json(output: str) -> Dict[str, Any]:
-    """
-    Robustly extract the FIRST valid JSON object from any LLM text.
-    Handles cases where model prints extra text before/after JSON.
-    """
     if not output:
         return {"error": "Empty LLM output"}
 
@@ -156,12 +150,9 @@ def validate_llm_payload(obj: Dict[str, Any]) -> Optional[str]:
 
 
 def make_fix_format_prompt(reason: str, raw_bad_output: str = "") -> str:
-    # Keep it short and strict; do not paste huge raw output by default (token safety)
-    # If you want, you can include a truncated snippet.
     snippet = (raw_bad_output or "").strip()
     if len(snippet) > 1200:
         snippet = snippet[:1200] + " ...[truncated]"
-
     return (
         "FORMAT ERROR. You MUST return ONLY a single JSON object and NOTHING ELSE.\n"
         "No explanations. No markdown. No comments. No code outside JSON.\n\n"
@@ -268,22 +259,6 @@ def write_rows_to_csv(rows: List[List[str]]) -> str:
     return path
 
 # ---------------------------------------------------------------------
-# QuickChart -> base64 PNG
-# ---------------------------------------------------------------------
-def quickchart_to_base64(chart_config: dict, width: int = 700, height: int = 400) -> str:
-    try:
-        resp = requests.post(
-            "https://quickchart.io/chart",
-            json={"chart": chart_config, "width": width, "height": height, "format": "png"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        raise HTTPException(502, f"QuickChart request failed: {e}")
-
-    return base64.b64encode(resp.content).decode("utf-8")
-
-# ---------------------------------------------------------------------
 # Dataset loading into DuckDB (no pandas)
 # ---------------------------------------------------------------------
 def save_upload_to_temp(content: bytes, suffix: str) -> str:
@@ -380,10 +355,52 @@ def format_preview_md(cols: List[str], rows: List[Tuple[Any, ...]]) -> str:
     return "\n".join([header, sep] + body_lines)
 
 # ---------------------------------------------------------------------
-# Web scraping helper (server-side, non-executor) -> temp file
+# Robust HTML table extraction (server-side)
 # ---------------------------------------------------------------------
+def _extract_best_html_table_rows(html: str) -> Optional[List[List[str]]]:
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+    except Exception:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    if not tables:
+        return None
+
+    best_rows: Optional[List[List[str]]] = None
+    best_score = 0
+
+    for table in tables:
+        rows: List[List[str]] = []
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["th", "td"])
+            if not cells:
+                continue
+            row = [c.get_text(" ", strip=True) for c in cells]
+            # Skip empty-like rows
+            if not any(x.strip() for x in row):
+                continue
+            rows.append(row)
+
+        # Score: prefer structured tables with many rows and columns
+        if not rows:
+            continue
+        max_cols = max(len(r) for r in rows)
+        score = len(rows) * max_cols
+        if score > best_score and max_cols >= 2 and len(rows) >= 3:
+            best_score = score
+            best_rows = rows
+
+    return best_rows
+
+
 def scrape_url_to_tempfile(url: str) -> Tuple[str, str]:
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.google.com"}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.google.com",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     try:
         r = requests.get(url, headers=headers, timeout=30)
         r.raise_for_status()
@@ -400,28 +417,14 @@ def scrape_url_to_tempfile(url: str) -> Tuple[str, str]:
     if "parquet" in ctype or lower.endswith(".parquet"):
         return save_upload_to_temp(r.content, ".parquet"), "scraped.parquet"
 
-    # HTML -> parse first table -> CSV (fallback to .txt)
-    try:
-        from bs4 import BeautifulSoup  # type: ignore
-        soup = BeautifulSoup(r.text, "lxml")
-        table = soup.find("table")
-        if not table:
-            return save_upload_to_temp(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
-
-        rows = []
-        for tr in table.find_all("tr"):
-            cells = tr.find_all(["th", "td"])
-            if not cells:
-                continue
-            rows.append([c.get_text(" ", strip=True) for c in cells])
-
-        if not rows:
-            return save_upload_to_temp(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
-
+    # HTML: extract best table
+    rows = _extract_best_html_table_rows(r.text)
+    if rows:
         csv_path = write_rows_to_csv(rows)
         return csv_path, "scraped.csv"
-    except Exception:
-        return save_upload_to_temp(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
+
+    # Last resort text
+    return save_upload_to_temp(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
 
 # ---------------------------------------------------------------------
 # LLM calls (no defaults; provider+model+api_key required)
@@ -489,7 +492,7 @@ def call_anthropic(model: str, api_key: str, prompt: str) -> str:
 
 def call_gemini(model: str, api_key: str, prompt: str) -> str:
     try:
-        from google import genai  # google-genai
+        from google import genai  # type: ignore
     except Exception:
         raise HTTPException(500, "google-genai package not installed. Add 'google-genai' to requirements.txt")
 
@@ -532,7 +535,7 @@ def call_llm(provider: str, model: str, api_key: str, prompt: str) -> str:
     raise HTTPException(400, f"Unsupported provider: {provider}")
 
 # ---------------------------------------------------------------------
-# Safe execution: run generated python in a subprocess (with strong hardening)
+# Safe execution: run generated python in a subprocess
 # ---------------------------------------------------------------------
 EXEC_PREAMBLE = r"""
 import os, json, re, base64
@@ -541,12 +544,6 @@ import requests
 
 DATA_PATH = os.environ.get("DATA_PATH", "")
 DATA_NAME = os.environ.get("DATA_NAME", "").lower()
-
-_SQL_KEYWORDS = {
-    "select","from","where","group","by","order","limit","having","join","left","right","inner","outer","on",
-    "as","and","or","not","null","is","in","like","distinct","count","sum","avg","min","max","case","when",
-    "then","else","end","with","union","all","cast","try_cast","substring","substr","replace","regexp_replace"
-}
 
 def quickchart_to_base64(chart_config: dict, width: int = 700, height: int = 400) -> str:
     resp = requests.post(
@@ -563,8 +560,52 @@ def _save_bytes(b: bytes, suf: str) -> str:
     f.write(b); f.flush(); f.close()
     return f.name
 
-def scrape_url_to_tempfile(url: str) -> tuple[str, str]:
-    headers = {"User-Agent":"Mozilla/5.0","Referer":"https://www.google.com"}
+def _extract_best_html_table_rows(html: str):
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    if not tables:
+        return None
+
+    best_rows = None
+    best_score = 0
+
+    for table in tables:
+        rows = []
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["th","td"])
+            if not cells:
+                continue
+            row = [c.get_text(" ", strip=True) for c in cells]
+            if not any(x.strip() for x in row):
+                continue
+            rows.append(row)
+        if not rows:
+            continue
+
+        max_cols = max(len(r) for r in rows)
+        score = len(rows) * max_cols
+        if score > best_score and max_cols >= 2 and len(rows) >= 3:
+            best_score = score
+            best_rows = rows
+
+    return best_rows
+
+def _rows_to_csv(rows):
+    import csv, tempfile
+    out = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="")
+    w = csv.writer(out)
+    for r in rows:
+        w.writerow(r)
+    out.flush(); out.close()
+    return out.name
+
+def scrape_url_to_tempfile(url: str):
+    headers = {
+        "User-Agent":"Mozilla/5.0",
+        "Referer":"https://www.google.com",
+        "Accept-Language":"en-US,en;q=0.9",
+    }
     r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     ctype = (r.headers.get("Content-Type") or "").lower()
@@ -577,40 +618,17 @@ def scrape_url_to_tempfile(url: str) -> tuple[str, str]:
     if "parquet" in ctype or lower.endswith(".parquet"):
         return _save_bytes(r.content, ".parquet"), "scraped.parquet"
 
-    # HTML -> first table -> CSV; fallback: text
-    try:
-        import csv, tempfile
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(r.text, "lxml")
-        table = soup.find("table")
-        if not table:
-            return _save_bytes(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
+    rows = _extract_best_html_table_rows(r.text)
+    if rows:
+        return _rows_to_csv(rows), "scraped.csv"
 
-        rows = []
-        for tr in table.find_all("tr"):
-            cells = tr.find_all(["th","td"])
-            if not cells:
-                continue
-            rows.append([c.get_text(" ", strip=True) for c in cells])
-
-        if not rows:
-            return _save_bytes(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
-
-        out = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="")
-        w = csv.writer(out)
-        for row in rows:
-            w.writerow(row)
-        out.flush(); out.close()
-        return out.name, "scraped.csv"
-    except Exception:
-        return _save_bytes(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
+    return _save_bytes(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
 
 def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(database=":memory:")
     conn.execute(f"DROP TABLE IF EXISTS {table}")
     name = (name or "").lower()
 
-    # Ensure a table always exists
     if not path:
         conn.execute(f"CREATE TABLE IF NOT EXISTS {table}(text VARCHAR)")
         return conn
@@ -621,21 +639,6 @@ def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDB
         conn.execute(f"CREATE TABLE {table} AS SELECT * FROM read_parquet(?)", [path])
     elif name.endswith(".json"):
         conn.execute(f"CREATE TABLE {table} AS SELECT * FROM read_json_auto(?)", [path])
-    elif name.endswith(".duckdb"):
-        conn.execute("ATTACH ? AS uploaded_db", [path])
-        tables = conn.execute("SHOW TABLES FROM uploaded_db").fetchall()
-        if not tables:
-            raise RuntimeError("No tables in DuckDB file.")
-        first_table = tables[0][0]
-        conn.execute(f"CREATE TABLE {table} AS SELECT * FROM uploaded_db.{first_table}")
-    elif name.endswith(".db") or name.endswith(".sqlite") or name.endswith(".sqlite3"):
-        conn.execute("INSTALL sqlite; LOAD sqlite;")
-        conn.execute("ATTACH ? AS uploaded_db (TYPE sqlite)", [path])
-        tables = conn.execute("SHOW TABLES FROM uploaded_db").fetchall()
-        if not tables:
-            raise RuntimeError("No tables in SQLite DB.")
-        first_table = tables[0][0]
-        conn.execute(f"CREATE TABLE {table} AS SELECT * FROM uploaded_db.{first_table}")
     elif name.endswith(".txt"):
         conn.execute(f"CREATE TABLE {table}(text VARCHAR)")
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -646,12 +649,9 @@ def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDB
     return conn
 
 duckdb_conn = load_into_duckdb(DATA_PATH, DATA_NAME, table="data")
-
-# Aliases to prevent NameError from LLM code
 db = duckdb_conn
 conn = duckdb_conn
 
-# Bind duckdb.sql/query to THIS connection so duckdb.sql("...") sees `data`
 duckdb.sql = duckdb_conn.sql
 duckdb.query = duckdb_conn.sql
 
@@ -671,11 +671,9 @@ def _quote_ident(name: str) -> str:
 def build_data_norm_view(base_table: str = "data", norm_view: str = "data_norm") -> dict:
     cols = duckdb_conn.execute(f"DESCRIBE {base_table}").fetchall()
     originals = [c[0] for c in cols]
-
-    mapping = {}  # normalized -> original
+    mapping = {}
     used = set()
     select_parts = []
-
     for orig in originals:
         norm = _norm_name(orig)
         if norm in used:
@@ -686,33 +684,16 @@ def build_data_norm_view(base_table: str = "data", norm_view: str = "data_norm")
         used.add(norm)
         mapping[norm] = orig
         select_parts.append(f"{_quote_ident(orig)} AS {_quote_ident(norm)}")
-
     duckdb_conn.execute(f"DROP VIEW IF EXISTS {norm_view}")
     duckdb_conn.execute(f"CREATE VIEW {norm_view} AS SELECT {', '.join(select_parts)} FROM {base_table}")
     return mapping
 
-COLMAP = build_data_norm_view("data", "data_norm")  # normalized -> original
-
-def col(name: str) -> str:
-    if not name:
-        return '""'
-    n = _norm_name(name)
-    if n in COLMAP:
-        return _quote_ident(COLMAP[n])
-    # allow matching original ignoring case
-    for _, v in COLMAP.items():
-        if v.lower() == name.strip().lower():
-            return _quote_ident(v)
-    return _quote_ident(name.strip())
+COLMAP = build_data_norm_view("data", "data_norm")
 
 def sql_fix(sql: str) -> str:
     s = sql
-
-    # Prefer normalized view by default
     s = re.sub(r"(?i)\bfrom\s+data\b", "FROM data_norm", s)
     s = re.sub(r"(?i)\bjoin\s+data\b", "JOIN data_norm", s)
-
-    # Fix substring/substr on numeric cols: cast to varchar
     s = re.sub(
         r"(?i)\bsubstring\(\s*([A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\")\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*\)",
         r"SUBSTRING(CAST(\1 AS VARCHAR), \2, \3)",
@@ -723,19 +704,6 @@ def sql_fix(sql: str) -> str:
         r"SUBSTR(CAST(\1 AS VARCHAR), \2, \3)",
         s,
     )
-
-    # If LLM uses normalized column names without quoting, quote them (safe)
-    def repl_token(m):
-        tok = m.group(0)
-        low = tok.lower()
-        if low in _SQL_KEYWORDS:
-            return tok
-        if low in COLMAP:
-            return _quote_ident(low)  # data_norm has these normalized identifiers
-        return tok
-
-    s = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", repl_token, s)
-
     return s
 
 def q(sql: str):
@@ -746,7 +714,6 @@ def scrape_url_to_duckdb_table(url: str, table: str = "data") -> str:
     name = (name or "").lower()
 
     duckdb_conn.execute(f"DROP TABLE IF EXISTS {table}")
-
     if name.endswith(".csv"):
         duckdb_conn.execute(f"CREATE TABLE {table} AS SELECT * FROM read_csv_auto(?, HEADER=true)", [path])
     elif name.endswith(".parquet"):
@@ -764,6 +731,13 @@ def scrape_url_to_duckdb_table(url: str, table: str = "data") -> str:
     global COLMAP
     COLMAP = build_data_norm_view(table, "data_norm")
     return table
+
+def ensure_structured_data(url: str) -> None:
+    # If data_norm is only text, rescrape and rebuild.
+    cols = duckdb_conn.execute("DESCRIBE data_norm").fetchall()
+    colnames = [c[0] for c in cols]
+    if len(colnames) == 1 and colnames[0].lower() == "text":
+        scrape_url_to_duckdb_table(url)
 
 results = {}
 """
@@ -893,39 +867,33 @@ async def analyze_data(request: Request):
             f"\n\nDataset loaded into DuckDB table `{table}`.\n"
             f"Columns (original): {', '.join(cols)}\n"
             f"Preview:\n{format_preview_md(cols, rows)}\n"
-            "In the executor you will ALSO have a normalized view `data_norm` with snake_case columns.\n"
-            "Prefer querying `data_norm`. Use helper `q(sql)` for auto-fixes.\n"
+            "Executor provides `data_norm` too. Prefer querying `data_norm`.\n"
         )
 
     rules: List[str] = []
-    rules.append("ABSOLUTE OUTPUT RULE: Return ONLY one JSON object. If you output anything else, the request fails.")
-    rules.append("0) Your response must be JSON ONLY: {\"keys\":[...],\"code\":\"...\"}. No markdown, no comments, no extra text.")
-    rules.append("1) In code: Use DuckDB via `duckdb_conn` (or aliases `db` / `conn`).")
-    rules.append("2) Prefer querying `data_norm` (normalized snake_case columns). Use helper `q(sql)` which auto-fixes SQL.")
-    rules.append("3) Always begin code by introspecting schema:")
-    rules.append("   - duckdb_conn.execute('DESCRIBE data').fetchall()")
-    rules.append("   - duckdb_conn.execute('DESCRIBE data_norm').fetchall()")
+    rules.append("ABSOLUTE OUTPUT RULE: Return ONLY one JSON object. Nothing else.")
+    rules.append("Return JSON only: {\"keys\":[...],\"code\":\"...\"}.")
+    rules.append("In code: use DuckDB via `duckdb_conn` (or aliases `db` / `conn`).")
+    rules.append("Prefer `data_norm`. Use helper `q(sql)`.")
+    rules.append("Always introspect schema first: DESCRIBE data and DESCRIBE data_norm.")
     if dataset_uploaded:
-        rules.append("4) Dataset is already loaded. Do NOT fetch external data unless required.")
+        rules.append("Dataset is already loaded. Do not fetch external data unless required.")
     else:
-        rules.append("4) No dataset is uploaded. If you need data, you MUST call `scrape_url_to_duckdb_table(url)` first.")
-    rules.append("5) Your Python code MUST populate dict `results` with exactly the requested keys.")
-    rules.append("6) Charts: use `quickchart_to_base64(chart_config)` returning base64 PNG.")
-    rules.append("7) Do NOT import pandas/numpy/matplotlib/seaborn/pyarrow/sklearn.")
-    rules.append("8) SQL safety: if you use SUBSTRING/SUBSTR, cast to VARCHAR; or use `q(sql)` to auto-fix.")
-    rules.append("9) Column names: do NOT invent underscore names. Use `data_norm` columns; if you need original, use helper `col('name')`.")
-    rules.append("10) Regex/backslash safety in SQL strings: use raw strings r'...' or escape backslashes \\\\.")
+        rules.append("No dataset uploaded: you MUST call `scrape_url_to_duckdb_table(url)` before querying `data`/`data_norm`.")
+        rules.append("After scraping, ensure structure with: ensure_structured_data(url).")
+    rules.append("Do NOT import pandas/numpy/matplotlib/seaborn/pyarrow/sklearn.")
+    rules.append("Charts: use quickchart_to_base64(chart_config) -> base64 PNG.")
+    rules.append("If `data_norm` has only column `text`, you must scrape structured data first (or parse text).")
 
     prompt = (
         "You are a full-stack autonomous data analyst.\n\n"
         + "Rules:\n" + "\n".join(rules) + "\n\n"
         + "Questions (from .txt):\n" + raw_questions + "\n"
         + (df_preview if df_preview else "") + "\n"
-        + "Return ONLY JSON in this format:\n"
+        + "Return ONLY JSON:\n"
           "{\"keys\":[\"...\"],\"code\":\"...\"}\n"
     )
 
-    # --- LLM call + robust parsing + strict retry ---
     llm_out = call_llm(provider=provider, model=model, api_key=api_key, prompt=prompt)
 
     parsed = clean_llm_json(llm_out)
@@ -942,10 +910,8 @@ async def analyze_data(request: Request):
         fix_prompt = make_fix_format_prompt(reason, llm_out)
         llm_out3 = call_llm(provider=provider, model=model, api_key=api_key, prompt=fix_prompt)
         parsed = clean_llm_json(llm_out3)
-
         if "error" in parsed:
             raise HTTPException(500, f"LLM output parsing error: {parsed.get('error')}. Raw: {parsed.get('raw')}")
-
         reason2 = validate_llm_payload(parsed)
         if reason2:
             raise HTTPException(500, f"LLM response invalid after retry: {reason2}")
