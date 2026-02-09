@@ -6,7 +6,6 @@
   <title>Curia-logica</title>
   <link rel="icon" href="/favicon.ico">
   <style>
-    /* No page scroll; panels manage their own scrolling */
     html, body { height: 100%; overflow: hidden; }
     * { margin:0; padding:0; box-sizing:border-box; }
 
@@ -18,7 +17,6 @@
                   radial-gradient(1200px 800px at 90% 0%, #0f253e 0%, #0b1221 60%);
     }
 
-    /* App layout: header (auto) + content (1fr) */
     .viewport {
       height: 100vh;
       display: grid;
@@ -32,9 +30,9 @@
       width: 100%;
       height: 100%;
       display: grid;
-      grid-template-rows: auto 1fr; /* header + content */
+      grid-template-rows: auto 1fr;
       gap: 12px;
-      min-height: 0; /* allow child overflow areas */
+      min-height: 0;
     }
 
     .header {
@@ -45,7 +43,6 @@
     .title h1 { font-size: 1.4rem; }
     .pill { padding:4px 10px; background:#16324f; border:1px solid #2a4d74; border-radius:999px; font-size:.8rem; opacity:.9 }
 
-    /* Main area: 2 columns; IMPORTANT: min-height:0 so children can scroll */
     .content {
       display:grid;
       grid-template-columns: 380px 1fr;
@@ -61,7 +58,7 @@
       box-shadow: 0 8px 30px rgba(0,0,0,0.35);
       display:flex;
       flex-direction: column;
-      min-height: 0; /* critical for inner scroll */
+      min-height: 0;
     }
 
     .card h3 {
@@ -70,7 +67,6 @@
       flex: 0 0 auto;
     }
 
-    /* LEFT: scrollable body; sticky actions at bottom */
     .left-body {
       padding: 14px 16px;
       display:flex;
@@ -78,13 +74,13 @@
       gap: 12px;
       flex: 1 1 auto;
       min-height: 0;
-      overflow-y: auto;               /* ✅ left side scrolls */
+      overflow-y: auto;
       -webkit-overflow-scrolling: touch;
     }
 
     .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
     label { display:block; font-weight:600; margin-bottom:6px; color:#cfe1ff; }
-    select, input[type="password"] {
+    select, input[type="password"], input[type="text"] {
       width: 100%; padding: 12px 12px;
       border-radius: 10px; border:1px solid #334155;
       background: #0f172a; color:#e5e7eb; outline:none;
@@ -101,7 +97,7 @@
 
     .chips {
       display:flex; flex-wrap:wrap; gap:8px; margin-top: 10px;
-      max-height: 160px; overflow: auto;    /* prevent tall lists from pushing buttons */
+      max-height: 160px; overflow: auto;
       -webkit-overflow-scrolling: touch;
     }
 
@@ -124,14 +120,13 @@
     .progress > div { height: 100%; width: 0%; background: linear-gradient(90deg,#00c6ff,#4ade80); transition: width .2s }
 
     .actions {
-      position: sticky; bottom: 0;      /* ✅ keeps buttons fixed at bottom of left panel */
+      position: sticky; bottom: 0;
       padding-top: 10px;
       background: linear-gradient(to top, rgba(22,28,45,1) 70%, rgba(22,28,45,0));
       display:flex; gap:8px;
       flex: 0 0 auto;
     }
 
-    /* RIGHT: results (only this scrolls vertically) */
     .results-wrap {
       display:flex; flex-direction: column;
       height: 100%; min-height: 0;
@@ -148,7 +143,7 @@
 
     .results {
       padding: 12px 16px 16px;
-      overflow-y: auto;                 /* ✅ results scroll here */
+      overflow-y: auto;
       overflow-x: hidden;
       flex: 1 1 auto; min-height: 0;
       -webkit-overflow-scrolling: touch;
@@ -168,7 +163,6 @@
       display:none
     }
 
-    /* Loading animation */
     .spinner {
       width: 32px; height: 32px; border-radius: 50%;
       border: 3px solid rgba(255,255,255,0.2);
@@ -192,13 +186,13 @@
         <div class="title">
           <img src="/favicon.ico" alt="app" width="28" height="28"/>
           <h1>Curia-logica</h1>
-          <h4 font="0.8rem">An analytic curia for modern data.</h4>
+          <h4 style="font-size:0.95rem; font-weight:500; opacity:0.9">An analytic curia for modern data.</h4>
           <span class="pill">Multi-Provider</span>
         </div>
       </div>
 
       <div class="content">
-        <!-- LEFT: scrollable controls with sticky actions -->
+        <!-- LEFT -->
         <div class="card">
           <h3>Setup</h3>
           <div class="left-body">
@@ -208,7 +202,7 @@
                 <select id="provider">
                   <option value="gemini">Gemini (Google)</option>
                   <option value="openai">OpenAI</option>
-                  <option value="claude">Claude (Anthropic)</option>
+                  <option value="anthropic">Claude (Anthropic)</option>
                 </select>
               </div>
               <div>
@@ -249,7 +243,7 @@
           </div>
         </div>
 
-        <!-- RIGHT: scrollable results -->
+        <!-- RIGHT -->
         <div class="card">
           <h3>Results</h3>
           <div class="results-wrap">
@@ -267,12 +261,7 @@
   <div id="toast" class="toast"></div>
 
 <script>
-/* Models */
-const PROVIDER_MODELS = {
-  gemini: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
-  openai: ["gpt-4o-mini", "gpt-4o", "o3-mini"],
-  claude: ["claude-3-7-sonnet", "claude-3-5-sonnet", "claude-3-5-haiku"]
-};
+let PROVIDER_MODELS = {};
 
 const el = (id) => document.getElementById(id);
 const providerSel = el("provider");
@@ -297,15 +286,31 @@ function showToast(msg) {
   setTimeout(() => { toast.style.display = "none"; }, 2500);
 }
 
+async function loadModels() {
+  const resp = await fetch("/api/models");
+  if (!resp.ok) throw new Error("Failed to load models");
+  const data = await resp.json();
+  PROVIDER_MODELS = data.providers || {};
+}
+
 function setModelsFor(provider) {
   modelSel.innerHTML = "";
-  (PROVIDER_MODELS[provider] || []).forEach((m, i) => {
+  const models = PROVIDER_MODELS[provider] || [];
+  if (!models.length) {
     const opt = document.createElement("option");
-    opt.value = m; opt.textContent = m ;
+    opt.value = "";
+    opt.textContent = "No models available";
+    modelSel.appendChild(opt);
+    return;
+  }
+  models.forEach((m) => {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = m;
     modelSel.appendChild(opt);
   });
 }
-setModelsFor(providerSel.value);
+
 providerSel.addEventListener("change", () => setModelsFor(providerSel.value));
 
 toggleKey.addEventListener("click", (e) => {
@@ -332,21 +337,30 @@ function renderChip(input, chips) {
   chips.innerHTML = "";
   const file = input.files[0];
   if (!file) return;
+
   const chip = document.createElement("div");
   chip.className = "chip";
+
   const icon = document.createElement("img");
   icon.src = "/favicon.ico";
+
   const span = document.createElement("span");
   span.textContent = file.name + " (" + (file.size/1024).toFixed(1) + " KB)";
+
   const btn = document.createElement("button");
   btn.textContent = "✕";
   btn.onclick = () => { input.value = ""; chips.innerHTML = ""; };
-  chip.appendChild(icon); chip.appendChild(span); chip.appendChild(btn);
+
+  chip.appendChild(icon);
+  chip.appendChild(span);
+  chip.appendChild(btn);
   chips.appendChild(chip);
 
   if (/(\.png|\.jpg|\.jpeg)$/i.test(file.name)) {
     const img = document.createElement("img");
-    img.style.maxWidth = "90px"; img.style.borderRadius = "8px"; img.style.marginLeft = "6px";
+    img.style.maxWidth = "90px";
+    img.style.borderRadius = "8px";
+    img.style.marginLeft = "6px";
     const r = new FileReader();
     r.onload = () => { img.src = r.result; };
     r.readAsDataURL(file);
@@ -359,7 +373,6 @@ attachZone(dZone, dInput, dChips);
 
 function setProgress(p) { bar.style.width = Math.min(100, Math.max(0, p)) + "%"; }
 
-/* Loading view */
 function showLoading() {
   results.innerHTML = `
     <div class="loading">
@@ -367,7 +380,7 @@ function showLoading() {
       <div>Analyzing...</div>
     </div>
   `;
-  results.scrollTop = 0;  // ensure starts at top
+  results.scrollTop = 0;
 }
 
 function displayResults(obj) {
@@ -375,8 +388,10 @@ function displayResults(obj) {
   Object.entries(obj).forEach(([k,v]) => {
     const item = document.createElement("div");
     item.className = "result-item";
+
     const title = document.createElement("h4");
     title.textContent = k;
+
     const content = document.createElement("div");
 
     let s = null;
@@ -385,6 +400,7 @@ function displayResults(obj) {
       s = v.image || v.base64 || v.plot || v.data || null;
       if (typeof s === "string") s = s.trim();
     }
+
     if (s) {
       s = s.replace(/^data:aimage\//i, 'data:image/');
       const base64Like = /^[A-Za-z0-9+/=\r\n]+$/.test(s) && s.length > 200 && !/\s{2,}/.test(s);
@@ -404,6 +420,7 @@ function displayResults(obj) {
       pre.textContent = typeof v === "string" ? v : JSON.stringify(v, null, 2);
       content.appendChild(pre);
     }
+
     item.appendChild(title);
     item.appendChild(content);
     results.appendChild(item);
@@ -411,7 +428,9 @@ function displayResults(obj) {
 }
 
 async function run() {
-  if (!qInput.files[0]) { toast.textContent="Please attach a .txt questions file."; toast.style.display="block"; setTimeout(()=>toast.style.display="none",2000); return; }
+  if (!qInput.files[0]) { showToast("Please attach a .txt questions file."); return; }
+  if (!apiKey.value.trim()) { showToast("Please enter API key."); return; }
+  if (!modelSel.value) { showToast("Please select a model."); return; }
 
   setProgress(10);
   showLoading();
@@ -427,34 +446,42 @@ async function run() {
     setProgress(35);
     const resp = await fetch("/api", { method:"POST", body: fd });
     setProgress(65);
+
     if (!resp.ok) {
       let msg = "HTTP " + resp.status;
-      try { const err = await resp.json(); if (err && err.detail) msg = err.detail; } catch {}
+      try {
+        const err = await resp.json();
+        if (err && err.detail) msg = err.detail;
+      } catch {}
       throw new Error(msg);
     }
+
     const data = await resp.json();
     setProgress(100);
     displayResults(data);
     window.__lastJSON = data;
-    toast.textContent="Done"; toast.style.display="block"; setTimeout(()=>toast.style.display="none",2000);
+    showToast("Done");
   } catch (e) {
-    results.innerHTML = '<div class="result-item"><h4>❌ Error</h4><div>'+ (e.message || "Unknown error") +'</div></div>';
-    toast.textContent="Error"; toast.style.display="block"; setTimeout(()=>toast.style.display="none",2000);
+    results.innerHTML = '<div class="result-item"><h4>❌ Error</h4><div>' + (e.message || "Unknown error") + '</div></div>';
+    showToast("Error");
     setProgress(0);
   }
 }
 
-document.getElementById("run").addEventListener("click", run);
-document.getElementById("clear").addEventListener("click", () => {
+el("run").addEventListener("click", run);
+
+el("clear").addEventListener("click", () => {
   qInput.value = ""; dInput.value = "";
   qChips.innerHTML = ""; dChips.innerHTML = "";
   results.innerHTML = ""; setProgress(0);
 });
+
 copyJSON.addEventListener("click", async () => {
   if (!window.__lastJSON) return;
   await navigator.clipboard.writeText(JSON.stringify(window.__lastJSON, null, 2));
-  toast.textContent="Copied JSON"; toast.style.display="block"; setTimeout(()=>toast.style.display="none",2000);
+  showToast("Copied JSON");
 });
+
 saveJSON.addEventListener("click", () => {
   if (!window.__lastJSON) return;
   const blob = new Blob([JSON.stringify(window.__lastJSON, null, 2)], {type:"application/json"});
@@ -464,8 +491,15 @@ saveJSON.addEventListener("click", () => {
   URL.revokeObjectURL(url);
 });
 
-/* Initialize models */
-(function initModels(){ setModelsFor(providerSel.value); })();
+(async function initModels(){
+  try {
+    await loadModels();
+    setModelsFor(providerSel.value);
+  } catch (e) {
+    console.error(e);
+    showToast("Could not load models");
+  }
+})();
 </script>
 </body>
 </html>
