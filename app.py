@@ -778,8 +778,9 @@ async def analyze_data(request: Request):
     rules.append("8) Use DuckDB SQL ONLY for data manipulation.")
     rules.append("9) Use Python built-ins or DuckDB results (lists/tuples) for logic.")
     rules.append("10) When writing SQL inside Python strings: ALWAYS use raw strings r'...' OR double-escape backslashes (\\\\).")
-    rules.append("11)Before referencing any column names, first check schema:duckdb_conn.execute('DESCRIBE data').fetchall() If the table only has column 'text', you must parse/scrape structured data first.")
-    rules.append("12) Never embed tuples into SQL. `scrape_url_to_tempfile(url)` returns (path, filename) — prefer `scrape_url_to_duckdb_table(url)`.")
+    rules.append("11) Before referencing any column names, first check schema:duckdb_conn.execute('DESCRIBE data').fetchall() If the table only has column 'text', you must parse/scrape structured data first.")
+    rules.append("12) If you use SUBSTRING/SUBSTR on a column, ALWAYS cast it to VARCHAR first:SUBSTRING(CAST(col AS VARCHAR), 1, n) Never call SUBSTRING on numeric types.")
+    rules.append("13) Never embed tuples into SQL. `scrape_url_to_tempfile(url)` returns (path, filename) — prefer `scrape_url_to_duckdb_table(url)`.")
 
     prompt = (
         "You are a full-stack autonomous data analyst.\n\n"
@@ -799,6 +800,13 @@ async def analyze_data(request: Request):
         raise HTTPException(500, f"Invalid LLM response shape. Got: {parsed}")
 
     code = parsed["code"]
+    # Auto-fix common DuckDB substring-on-numeric mistake
+    code = re.sub(
+        r"SUBSTRING\(\s*([A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\")\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*\)",
+        r"SUBSTRING(CAST(\1 AS VARCHAR), \2, \3)",
+        code
+    )
+
     keys = parsed["keys"]
 
     if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
