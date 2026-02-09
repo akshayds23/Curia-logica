@@ -520,18 +520,39 @@ def call_anthropic(model: str, api_key: str, prompt: str) -> str:
 
 def call_gemini(model: str, api_key: str, prompt: str) -> str:
     try:
-        import google.generativeai as genai  # type: ignore
+        from google import genai  # google-genai
     except Exception:
-        raise HTTPException(500, "google-generativeai package not installed.")
+        raise HTTPException(500, "google-genai package not installed. Add 'google-genai' to requirements.txt")
 
     try:
-        genai.configure(api_key=api_key)
-        m = genai.GenerativeModel(model_name=model)
-        resp = m.generate_content(prompt)
-        text = getattr(resp, "text", "") or ""
-        return text.strip()
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt
+        )
+
+        text = getattr(resp, "text", None)
+        if text:
+            return text.strip()
+
+        # Fallback: try to pull text from response structure safely
+        # (structure can vary slightly across versions)
+        try:
+            parts = []
+            for cand in (getattr(resp, "candidates", None) or []):
+                content = getattr(cand, "content", None)
+                if not content:
+                    continue
+                for part in (getattr(content, "parts", None) or []):
+                    t = getattr(part, "text", None)
+                    if t:
+                        parts.append(t)
+            return "\n".join(parts).strip()
+        except Exception:
+            return ""
     except Exception as e:
         raise HTTPException(502, f"Gemini API call failed: {e}")
+
 
 
 def call_llm(provider: str, model: str, api_key: str, prompt: str) -> str:
@@ -805,6 +826,11 @@ async def analyze_data(request: Request):
     rules.append("4) Your Python code MUST create a dict named `results` and fill it with exactly those keys.")
     rules.append("5) For charts, use `quickchart_to_base64(chart_config)` to return base64 PNG.")
     rules.append("6) Keep code deterministic; define variables before use; no prints other than building results.")
+    rules.append("7) DO NOT import or use pandas, numpy, matplotlib, seaborn, pyarrow, or sklearn.")
+    rules.append("8) Use DuckDB SQL ONLY for data manipulation.")
+    rules.append("9) Use Python built-ins or DuckDB results (lists/tuples) for logic.")
+    rules.append("10)When writing SQL inside Python strings:- ALWAYS use raw strings (prefix with r'...') - OR double-escape backslashes (\\). Never write regex like '\[.*\]' inside normal strings.")
+
     rules_text = "Rules:\n" + "\n".join(rules)
 
     prompt = (
