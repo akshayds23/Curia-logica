@@ -552,11 +552,14 @@ def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDB
 
     return conn
 
-duckdb_conn = load_into_duckdb(DATA_PATH, DATA_NAME, table="data")
-
-# Aliases to prevent NameError from LLM-generated code
+# Common aliases so LLM-generated code doesn't NameError
 db = duckdb_conn
 conn = duckdb_conn
+
+# Make duckdb.sql(...) and duckdb.query(...) use THIS connection
+duckdb.sql = duckdb_conn.sql
+duckdb.query = duckdb_conn.sql
+
 
 results = {}
 
