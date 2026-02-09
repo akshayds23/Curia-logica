@@ -1,6 +1,5 @@
 import os
 import re
-import io
 import json
 import base64
 import tempfile
@@ -439,7 +438,6 @@ def call_gemini(model: str, api_key: str, prompt: str) -> str:
         if text:
             return text.strip()
 
-        # fallback
         parts = []
         for cand in (getattr(resp, "candidates", None) or []):
             content = getattr(cand, "content", None)
@@ -472,6 +470,7 @@ def call_llm(provider: str, model: str, api_key: str, prompt: str) -> str:
 # ---------------------------------------------------------------------
 # Safe execution: run generated python in a subprocess
 # ---------------------------------------------------------------------
+
 EXEC_PREAMBLE = r"""
 import os, json, re, base64
 import duckdb
@@ -479,6 +478,13 @@ import requests
 
 DATA_PATH = os.environ.get("DATA_PATH", "")
 DATA_NAME = os.environ.get("DATA_NAME", "").lower()
+
+# Minimal keyword list for naive SQL token rewriting safety
+_SQL_KEYWORDS = {
+    "select","from","where","group","by","order","limit","having","join","left","right","inner","outer","on",
+    "as","and","or","not","null","is","in","like","distinct","count","sum","avg","min","max","case","when",
+    "then","else","end","with","union","all","cast","try_cast","substring","substr","replace","regexp_replace"
+}
 
 def quickchart_to_base64(chart_config: dict, width: int = 700, height: int = 400) -> str:
     resp = requests.post(
@@ -489,22 +495,18 @@ def quickchart_to_base64(chart_config: dict, width: int = 700, height: int = 400
     resp.raise_for_status()
     return base64.b64encode(resp.content).decode("utf-8")
 
+def _save_bytes(b: bytes, suf: str) -> str:
+    import tempfile
+    f = tempfile.NamedTemporaryFile(delete=False, suffix=suf)
+    f.write(b); f.flush(); f.close()
+    return f.name
+
 def scrape_url_to_tempfile(url: str) -> tuple[str, str]:
     headers = {"User-Agent":"Mozilla/5.0","Referer":"https://www.google.com"}
     r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     ctype = (r.headers.get("Content-Type") or "").lower()
     lower = url.lower()
-
-    import tempfile, csv
-
-    def _save_bytes(b: bytes, suf: str) -> str:
-        f = tempfile.NamedTemporaryFile(delete=False, suffix=suf)
-        f.write(b); f.flush(); f.close()
-        return f.name
-
-    def _save_text(t: str, suf: str) -> str:
-        return _save_bytes(t.encode("utf-8", errors="ignore"), suf)
 
     # direct file formats
     if "application/json" in ctype or lower.endswith(".json"):
@@ -514,47 +516,44 @@ def scrape_url_to_tempfile(url: str) -> tuple[str, str]:
     if "parquet" in ctype or lower.endswith(".parquet"):
         return _save_bytes(r.content, ".parquet"), "scraped.parquet"
 
-    # HTML -> parse first table -> CSV
+    # HTML -> first table -> CSV (fallback: text)
     try:
-        from bs4 import BeautifulSoup  # bs4 is in your requirements
+        import csv
+        from bs4 import BeautifulSoup
         soup = BeautifulSoup(r.text, "lxml")
         table = soup.find("table")
         if not table:
-            return _save_text(r.text, ".txt"), "scraped.txt"
+            return _save_bytes(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
 
         rows = []
         for tr in table.find_all("tr"):
-            cells = tr.find_all(["th", "td"])
+            cells = tr.find_all(["th","td"])
             if not cells:
                 continue
             rows.append([c.get_text(" ", strip=True) for c in cells])
 
         if not rows:
-            return _save_text(r.text, ".txt"), "scraped.txt"
+            return _save_bytes(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
 
+        import tempfile
         out = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="")
         w = csv.writer(out)
-
-        # write all rows; DuckDB read_csv_auto will infer header if present
         for row in rows:
             w.writerow(row)
-
-        out.flush()
-        out.close()
+        out.flush(); out.close()
         return out.name, "scraped.csv"
-
     except Exception:
-        return _save_text(r.text, ".txt"), "scraped.txt"
+        return _save_bytes(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
 
 def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(database=":memory:")
     conn.execute(f"DROP TABLE IF EXISTS {table}")
     name = (name or "").lower()
 
+    # Always ensure table exists, even without upload
     if not path:
         conn.execute(f"CREATE TABLE IF NOT EXISTS {table}(text VARCHAR)")
         return conn
-
 
     if name.endswith(".csv"):
         conn.execute(f"CREATE TABLE {table} AS SELECT * FROM read_csv_auto(?, HEADER=true)", [path])
@@ -585,25 +584,119 @@ def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDB
         raise RuntimeError(f"Unsupported dataset type in executor: {name}")
 
     return conn
-    
+
 duckdb_conn = load_into_duckdb(DATA_PATH, DATA_NAME, table="data")
 
-# Common aliases so LLM-generated code doesn't NameError
+# Aliases to prevent NameError from LLM code
 db = duckdb_conn
 conn = duckdb_conn
 
-# Make duckdb.sql(...) and duckdb.query(...) use THIS connection
+# Bind global duckdb.sql/query to this connection so duckdb.sql("...") sees table `data`
 duckdb.sql = duckdb_conn.sql
 duckdb.query = duckdb_conn.sql
 
+def _norm_name(s: str) -> str:
+    # normalize a column name to snake_case-ish
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if not s:
+        s = "col"
+    if s[0].isdigit():
+        s = "c_" + s
+    return s
 
-results = {}
+def _quote_ident(name: str) -> str:
+    # Double-quote and escape embedded quotes
+    return '"' + (name or "").replace('"', '""') + '"'
 
+def build_data_norm_view(base_table: str = "data", norm_view: str = "data_norm") -> dict:
+    # Create a normalized view with safe column aliases + mapping
+    cols = duckdb_conn.execute(f"DESCRIBE {base_table}").fetchall()
+    originals = [c[0] for c in cols]  # col name in 1st field
+
+    mapping = {}  # normalized -> original
+    used = set()
+    select_parts = []
+
+    for orig in originals:
+        norm = _norm_name(orig)
+        # de-dup normalized names
+        if norm in used:
+            i = 2
+            while f"{norm}_{i}" in used:
+                i += 1
+            norm = f"{norm}_{i}"
+        used.add(norm)
+        mapping[norm] = orig
+        select_parts.append(f"{_quote_ident(orig)} AS {_quote_ident(norm)}")
+
+    duckdb_conn.execute(f"DROP VIEW IF EXISTS {norm_view}")
+    duckdb_conn.execute(f"CREATE VIEW {norm_view} AS SELECT {', '.join(select_parts)} FROM {base_table}")
+
+    return mapping
+
+COLMAP = build_data_norm_view("data", "data_norm")  # normalized -> original
+
+def col(name: str) -> str:
+    # Return a safely-quoted original identifier if possible; otherwise quote provided.
+    if not name:
+        return '""'
+    n = _norm_name(name)
+    if n in COLMAP:
+        return _quote_ident(COLMAP[n])
+    # also allow exact original match ignoring case
+    for k, v in COLMAP.items():
+        if v.lower() == name.strip().lower():
+            return _quote_ident(v)
+    return _quote_ident(name.strip())
+
+def sql_fix(sql: str) -> str:
+    # General SQL sanitizer:
+    # 1) Prefer data_norm view
+    s = sql
+
+    # Replace FROM/JOIN data -> data_norm (but don't break data_norm itself)
+    s = re.sub(r"(?i)\bfrom\s+data\b", "FROM data_norm", s)
+    s = re.sub(r"(?i)\bjoin\s+data\b", "JOIN data_norm", s)
+
+    # Fix SUBSTRING(col, a, b) where col might be numeric
+    s = re.sub(
+        r"(?i)\bsubstring\(\s*([A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\")\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*\)",
+        r"SUBSTRING(CAST(\1 AS VARCHAR), \2, \3)",
+        s,
+    )
+    s = re.sub(
+        r"(?i)\bsubstr\(\s*([A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\")\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*\)",
+        r"SUBSTR(CAST(\1 AS VARCHAR), \2, \3)",
+        s,
+    )
+
+    # Rewrite unquoted normalized identifiers to quoted originals when needed.
+    # This helps when the model uses Worldwide_gross but original is "Worldwide gross".
+    # We only rewrite tokens that match COLMAP keys and are NOT SQL keywords.
+    def repl_token(m):
+        tok = m.group(0)
+        low = tok.lower()
+        if low in _SQL_KEYWORDS:
+            return tok
+        # if token exists as normalized column in data_norm, keep it
+        if low in COLMAP:
+            # In data_norm, the column is already low (normalized)
+            return _quote_ident(low)
+        return tok
+
+    # Replace bare tokens in SELECT/WHERE etc (naive but effective for most LLM SQL)
+    s = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", repl_token, s)
+
+    return s
+
+def q(sql: str):
+    # convenience: auto-fix + execute and return cursor
+    return duckdb_conn.execute(sql_fix(sql))
 
 def scrape_url_to_duckdb_table(url: str, table: str = "data") -> str:
-    # Downloads URL and loads into DuckDB table.
-    # Supports CSV/JSON/Parquet; HTML falls back to text in a one-column table.
-    # Returns the table name.
+    # Load web data into DuckDB and rebuild data_norm.
     path, name = scrape_url_to_tempfile(url)
     name = (name or "").lower()
 
@@ -623,23 +716,29 @@ def scrape_url_to_duckdb_table(url: str, table: str = "data") -> str:
     else:
         raise RuntimeError(f"Unsupported scraped type: {name}")
 
+    # Rebuild normalized view + mapping
+    global COLMAP
+    COLMAP = build_data_norm_view(table, "data_norm")
     return table
 
 results = {}
 """
 
-
 BLOCKED_IMPORT_RE = re.compile(
     r"(^|\n)\s*(import\s+(pandas|numpy|matplotlib|seaborn|pyarrow)\b|from\s+(pandas|numpy|matplotlib|seaborn|pyarrow)\s+import\b)",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
 def run_user_code(code: str, data_path: str, data_name: str, timeout: int) -> Dict[str, Any]:
-    # hard block heavy libs if LLM sneaks them in
     if BLOCKED_IMPORT_RE.search(code or ""):
-        return {"status": "error", "message": "Generated code tried to import blocked libraries (pandas/numpy/matplotlib/pyarrow/seaborn)."}
+        return {
+            "status": "error",
+            "message": "Generated code tried to import blocked libraries (pandas/numpy/matplotlib/pyarrow/seaborn).",
+        }
 
-    script = EXEC_PREAMBLE + "\n\n" + code + "\n\n" + r"""
+    # Extra safety: discourage direct duckdb.sql usage (we already bind it, but still)
+    # Also normalize common mistakes: substring casts are handled inside executor via sql_fix()
+    script = EXEC_PREAMBLE + "\n\n" + (code or "") + "\n\n" + r"""
 print(json.dumps({"status":"success","result":results}, default=str), flush=True)
 """
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
@@ -688,7 +787,9 @@ print(json.dumps({"status":"success","result":results}, default=str), flush=True
 # ---------------------------------------------------------------------
 @app.get("/api/models", include_in_schema=False)
 async def list_models():
-    return JSONResponse({"providers": {"openai": OPENAI_MODELS, "anthropic": ANTHROPIC_MODELS, "gemini": GEMINI_MODELS}})
+    return JSONResponse(
+        {"providers": {"openai": OPENAI_MODELS, "anthropic": ANTHROPIC_MODELS, "gemini": GEMINI_MODELS}}
+    )
 
 @app.post("/api")
 async def analyze_data(request: Request):
@@ -755,32 +856,41 @@ async def analyze_data(request: Request):
 
         df_preview = (
             f"\n\nDataset loaded into DuckDB table `{table}`.\n"
-            f"Columns: {', '.join(cols)}\n"
+            f"Columns (original): {', '.join(cols)}\n"
             f"Preview:\n{format_preview_md(cols, rows)}\n"
-            "You can query it using `duckdb_conn` in generated code.\n"
-            "Example: duckdb_conn.execute('SELECT COUNT(*) FROM data').fetchone()[0]\n"
+            "In the executor you will ALSO have a normalized view `data_norm` with snake_case columns.\n"
+            "Always query `data_norm` unless you explicitly need original names.\n"
         )
 
     rules: List[str] = []
+
+    # Core invariant for all cases
+    rules.append("0) You MUST query DuckDB using `duckdb_conn.execute(...)` or helper `q(sql)`.")
+    rules.append("0b) A normalized view `data_norm` always exists; prefer it over `data`.")
+    rules.append("0c) Always start by checking schema:\n"
+                 "   - duckdb_conn.execute('DESCRIBE data').fetchall()\n"
+                 "   - duckdb_conn.execute('DESCRIBE data_norm').fetchall()")
+
     if dataset_uploaded:
-        rules.append("1) You have access to a DuckDB connection `duckdb_conn` with a table named `data`.")
+        rules.append("1) A dataset is already loaded. Use table/view: `data_norm` (preferred) or `data` (original).")
         rules.append("2) Do NOT fetch external data unless absolutely required.")
     else:
-        rules.append("1) If you need web data, call `scrape_url_to_duckdb_table(url)` which loads it into table `data`.")
-        rules.append("1b) If no dataset is uploaded, you MUST call `scrape_url_to_duckdb_table(url)` before running any SQL that reads from `data`.")
-        rules.append("2) Do NOT use read_html(). DuckDB does not support read_html().")
+        rules.append("1) No dataset is uploaded. If you need data, you MUST call `scrape_url_to_duckdb_table(url)` first.")
+        rules.append("1b) After scraping, query `data_norm` (preferred).")
 
     rules.append('3) Return ONLY a valid JSON object with keys: "keys" (list) and "code" (string).')
     rules.append("4) Your Python code MUST create a dict named `results` and fill it with exactly those keys.")
     rules.append("5) For charts, use `quickchart_to_base64(chart_config)` to return base64 PNG.")
-    rules.append("6) Keep code deterministic; define variables before use; no prints other than building results.")
-    rules.append("7) DO NOT import or use pandas, numpy, matplotlib, seaborn, pyarrow, or sklearn.")
-    rules.append("8) Use DuckDB SQL ONLY for data manipulation.")
-    rules.append("9) Use Python built-ins or DuckDB results (lists/tuples) for logic.")
-    rules.append("10) When writing SQL inside Python strings: ALWAYS use raw strings r'...' OR double-escape backslashes (\\\\).")
-    rules.append("11) Before referencing any column names, first check schema:duckdb_conn.execute('DESCRIBE data').fetchall() If the table only has column 'text', you must parse/scrape structured data first.")
-    rules.append("12) If you use SUBSTRING/SUBSTR on a column, ALWAYS cast it to VARCHAR first:SUBSTRING(CAST(col AS VARCHAR), 1, n) Never call SUBSTRING on numeric types.")
-    rules.append("13) Never embed tuples into SQL. `scrape_url_to_tempfile(url)` returns (path, filename) — prefer `scrape_url_to_duckdb_table(url)`.")
+    rules.append("6) Keep code deterministic; define variables before use; do not print anything (results only).")
+    rules.append("7) DO NOT import or use pandas, numpy, matplotlib, seaborn, pyarrow, sklearn.")
+    rules.append("8) Prefer SQL over Python loops. Use DuckDB SQL and fetch results via fetchone()/fetchall().")
+    rules.append("9) Column name safety:")
+    rules.append("   - Prefer `data_norm` which has snake_case safe names.")
+    rules.append("   - If you must reference original columns that may have spaces, use helper `col('name')` to get a safely quoted identifier.")
+    rules.append("10) Regex/backslash safety: inside SQL strings use raw strings r'...' OR escape backslashes \\\\.")
+    rules.append("11) SUBSTRING/SUBSTR safety: always CAST to VARCHAR first; or rely on `sql_fix()` by executing via `q(sql)`.")
+    rules.append("12) Never use duckdb.read_html / read_html / pandas. Not available.")
+    rules.append("13) Use helper `q(sql)` when possible; it auto-fixes common SQL mistakes and prefers data_norm.")
 
     prompt = (
         "You are a full-stack autonomous data analyst.\n\n"
@@ -800,13 +910,6 @@ async def analyze_data(request: Request):
         raise HTTPException(500, f"Invalid LLM response shape. Got: {parsed}")
 
     code = parsed["code"]
-    # Auto-fix common DuckDB substring-on-numeric mistake
-    code = re.sub(
-        r"SUBSTRING\(\s*([A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\")\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*\)",
-        r"SUBSTRING(CAST(\1 AS VARCHAR), \2, \3)",
-        code
-    )
-
     keys = parsed["keys"]
 
     if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
