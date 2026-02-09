@@ -551,6 +551,7 @@ def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDB
         raise RuntimeError(f"Unsupported dataset type in executor: {name}")
 
     return conn
+duckdb_conn = load_into_duckdb(DATA_PATH, DATA_NAME, table="data")
 
 # Common aliases so LLM-generated code doesn't NameError
 db = duckdb_conn
