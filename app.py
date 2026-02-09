@@ -496,21 +496,55 @@ def scrape_url_to_tempfile(url: str) -> tuple[str, str]:
     ctype = (r.headers.get("Content-Type") or "").lower()
     lower = url.lower()
 
-    import tempfile
-    def _save(b: bytes, suf: str) -> str:
+    import tempfile, csv
+
+    def _save_bytes(b: bytes, suf: str) -> str:
         f = tempfile.NamedTemporaryFile(delete=False, suffix=suf)
         f.write(b); f.flush(); f.close()
         return f.name
 
-    if "application/json" in ctype or lower.endswith(".json"):
-        return _save(r.content, ".json"), "scraped.json"
-    if "text/csv" in ctype or lower.endswith(".csv"):
-        return _save(r.content, ".csv"), "scraped.csv"
-    if "parquet" in ctype or lower.endswith(".parquet"):
-        return _save(r.content, ".parquet"), "scraped.parquet"
+    def _save_text(t: str, suf: str) -> str:
+        return _save_bytes(t.encode("utf-8", errors="ignore"), suf)
 
-    # HTML fallback: store as .txt
-    return _save(r.text.encode("utf-8", errors="ignore"), ".txt"), "scraped.txt"
+    # direct file formats
+    if "application/json" in ctype or lower.endswith(".json"):
+        return _save_bytes(r.content, ".json"), "scraped.json"
+    if "text/csv" in ctype or lower.endswith(".csv"):
+        return _save_bytes(r.content, ".csv"), "scraped.csv"
+    if "parquet" in ctype or lower.endswith(".parquet"):
+        return _save_bytes(r.content, ".parquet"), "scraped.parquet"
+
+    # HTML -> parse first table -> CSV
+    try:
+        from bs4 import BeautifulSoup  # bs4 is in your requirements
+        soup = BeautifulSoup(r.text, "lxml")
+        table = soup.find("table")
+        if not table:
+            return _save_text(r.text, ".txt"), "scraped.txt"
+
+        rows = []
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["th", "td"])
+            if not cells:
+                continue
+            rows.append([c.get_text(" ", strip=True) for c in cells])
+
+        if not rows:
+            return _save_text(r.text, ".txt"), "scraped.txt"
+
+        out = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="")
+        w = csv.writer(out)
+
+        # write all rows; DuckDB read_csv_auto will infer header if present
+        for row in rows:
+            w.writerow(row)
+
+        out.flush()
+        out.close()
+        return out.name, "scraped.csv"
+
+    except Exception:
+        return _save_text(r.text, ".txt"), "scraped.txt"
 
 def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(database=":memory:")
@@ -551,6 +585,7 @@ def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDB
         raise RuntimeError(f"Unsupported dataset type in executor: {name}")
 
     return conn
+    
 duckdb_conn = load_into_duckdb(DATA_PATH, DATA_NAME, table="data")
 
 # Common aliases so LLM-generated code doesn't NameError
@@ -743,7 +778,8 @@ async def analyze_data(request: Request):
     rules.append("8) Use DuckDB SQL ONLY for data manipulation.")
     rules.append("9) Use Python built-ins or DuckDB results (lists/tuples) for logic.")
     rules.append("10) When writing SQL inside Python strings: ALWAYS use raw strings r'...' OR double-escape backslashes (\\\\).")
-    rules.append("11) Never embed tuples into SQL. `scrape_url_to_tempfile(url)` returns (path, filename) — prefer `scrape_url_to_duckdb_table(url)`.")
+    rules.append("11)Before referencing any column names, first check schema:duckdb_conn.execute("DESCRIBE data").fetchall() If the table only has column 'text', you must parse/scrape structured data first.")
+    rules.append("12) Never embed tuples into SQL. `scrape_url_to_tempfile(url)` returns (path, filename) — prefer `scrape_url_to_duckdb_table(url)`.")
 
     prompt = (
         "You are a full-stack autonomous data analyst.\n\n"
