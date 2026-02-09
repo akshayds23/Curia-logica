@@ -518,7 +518,9 @@ def load_into_duckdb(path: str, name: str, table: str = "data") -> duckdb.DuckDB
     name = (name or "").lower()
 
     if not path:
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {table}(text VARCHAR)")
         return conn
+
 
     if name.endswith(".csv"):
         conn.execute(f"CREATE TABLE {table} AS SELECT * FROM read_csv_auto(?, HEADER=true)", [path])
@@ -719,6 +721,7 @@ async def analyze_data(request: Request):
         rules.append("2) Do NOT fetch external data unless absolutely required.")
     else:
         rules.append("1) If you need web data, call `scrape_url_to_duckdb_table(url)` which loads it into table `data`.")
+        rules.append("1b) If no dataset is uploaded, you MUST call `scrape_url_to_duckdb_table(url)` before running any SQL that reads from `data`.")
         rules.append("2) Do NOT use read_html(). DuckDB does not support read_html().")
 
     rules.append('3) Return ONLY a valid JSON object with keys: "keys" (list) and "code" (string).')
