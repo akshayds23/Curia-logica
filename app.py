@@ -1,15 +1,3 @@
-
-
-import os
-import re
-import json
-import base64
-import tempfile
-import sys
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import io
 import os
 import re
 import json
@@ -17,60 +5,26 @@ import base64
 import tempfile
 import subprocess
 import logging
+import sys
+import io
 from io import BytesIO
-from typing import Dict, Any, List
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi import FastAPI
-from dotenv import load_dotenv
+from typing import Dict, Any, List, Optional
 
 import requests
 import pandas as pd
-import matplotlib.pyplot as plt
 import numpy as np
-import io, os, json, re
-import google.generativeai as genai
 
-# Optional image conversion
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except Exception:
-    PIL_AVAILABLE = False
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse, Response
+from dotenv import load_dotenv
 
-from PIL import Image
-# OCR (optional)
-try:
-    import pytesseract
-    PYTESS_AVAILABLE = True
-except Exception:
-    pytesseract = None
-    PYTESS_AVAILABLE = False
-
-try:
-    import cv2  # comes from opencv-python-headless
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-
-try:
-    import pytesseract
-    PYTESS_AVAILABLE = True
-except ImportError:
-    PYTESS_AVAILABLE = False
-
-# NEW: PyMuPDF for PDFs
-try:
-    import fitz  # PyMuPDF
-    HAS_PYMUPDF = True
-except Exception:
-    HAS_PYMUPDF = False
-
-# LangChain / LLM imports (keep as you used)
+# LangChain / LLM imports
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_genai import ChatGoogleGenerativeAI
-# NEW: Optional other providers via LangChain
+from langchain_core.tools import tool
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+
+# Optional other providers via LangChain
 try:
     from langchain_openai import ChatOpenAI
     HAS_LC_OPENAI = True
@@ -83,8 +37,20 @@ try:
 except Exception:
     HAS_LC_ANTHROPIC = False
 
-from langchain_core.tools import tool
-from langchain.agents import create_tool_calling_agent, AgentExecutor
+# Optional image support
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+# Optional PDF support (PyMuPDF)
+try:
+    import fitz  # PyMuPDF
+    HAS_PYMUPDF = True
+except Exception:
+    HAS_PYMUPDF = False
+
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -94,7 +60,16 @@ app = FastAPI(title="TDS Data Analyst Agent")
 
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 180))
 
+# OCR.space config (required for OCR)
+OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "")
+OCRSPACE_LANGUAGE = os.getenv("OCRSPACE_LANGUAGE", "eng")
+OCRSPACE_TIMEOUT = int(os.getenv("OCRSPACE_TIMEOUT_SECONDS", 60))
+OCRSPACE_MAX_PDF_PAGES = int(os.getenv("OCRSPACE_MAX_PDF_PAGES", 3))  # keep small for serverless
 
+
+# -----------------------------
+# Frontend route
+# -----------------------------
 from pathlib import Path
 
 @app.get("/", response_class=HTMLResponse)
@@ -109,12 +84,130 @@ async def serve_frontend():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
+# -----------------------------
+# OCR.space helpers
+# -----------------------------
+def ocr_image_with_ocrspace(image_bytes: bytes, language: str = "eng") -> str:
+    if not OCRSPACE_API_KEY:
+        raise HTTPException(400, "OCRSPACE_API_KEY is not set (required for OCR).")
+
+    try:
+        resp = requests.post(
+            "https://api.ocr.space/parse/image",
+            files={"file": ("image.png", image_bytes)},
+            data={
+                "apikey": OCRSPACE_API_KEY,
+                "language": language,
+                "isOverlayRequired": False,
+            },
+            timeout=OCRSPACE_TIMEOUT,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except requests.RequestException as e:
+        raise HTTPException(502, f"OCR.space request failed: {str(e)}")
+    except Exception as e:
+        raise HTTPException(502, f"OCR.space response parse failed: {str(e)}")
+
+    if result.get("IsErroredOnProcessing"):
+        msg = result.get("ErrorMessage") or result.get("ErrorDetails") or "Unknown OCR error"
+        raise HTTPException(502, f"OCR.space error: {msg}")
+
+    parsed = result.get("ParsedResults") or []
+    if not parsed:
+        return ""
+    return (parsed[0].get("ParsedText") or "").strip()
+
+
+def _lines_to_table_df(lines: List[str]) -> Optional[pd.DataFrame]:
+    """
+    Simple heuristic: split on 2+ spaces, keep rows with the modal column count.
+    """
+    rows: List[List[str]] = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        parts = re.split(r"\s{2,}", s)
+        rows.append(parts)
+    if not rows:
+        return None
+
+    counts: Dict[int, int] = {}
+    for r in rows:
+        counts[len(r)] = counts.get(len(r), 0) + 1
+    best_cols = max(counts, key=counts.get)
+    if best_cols < 2:
+        return None
+
+    filtered = [r for r in rows if len(r) == best_cols]
+    if len(filtered) < max(3, int(0.4 * len(rows))):
+        return None
+
+    header = None
+    maybe_header = filtered[0]
+    if len(set(maybe_header)) == len(maybe_header):
+        header = [str(c).strip() for c in maybe_header]
+
+    if header:
+        df = pd.DataFrame(filtered[1:], columns=header)
+    else:
+        df = pd.DataFrame(filtered)
+
+    df = df.apply(pd.to_numeric, errors="ignore")
+    return df
+
+
+def ocr_image_to_df(image_bytes: bytes) -> pd.DataFrame:
+    # OCR.space accepts bytes directly; no need for PIL
+    text = ocr_image_with_ocrspace(image_bytes, language=OCRSPACE_LANGUAGE)
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    df_tab = _lines_to_table_df(lines)
+    if df_tab is not None and not df_tab.empty:
+        return df_tab
+    return pd.DataFrame({"ocr_text": [text]})
+
+
+def pdf_to_dataframe_with_pymupdf(pdf_bytes: bytes) -> pd.DataFrame:
+    if not HAS_PYMUPDF:
+        raise HTTPException(400, "PyMuPDF (fitz) is required for PDF handling.")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    # 1) Try normal text extraction first
+    page_texts: List[str] = [p.get_text("text") for p in doc]
+    if any(t.strip() for t in page_texts):
+        return pd.DataFrame({"page": list(range(1, len(page_texts) + 1)), "text": page_texts})
+
+    # 2) If scanned / no text, render a few pages and OCR via OCR.space
+    ocr_lines: List[str] = []
+    pages_to_ocr = min(len(doc), max(1, OCRSPACE_MAX_PDF_PAGES))
+    for i in range(pages_to_ocr):
+        p = doc[i]
+        mat = fitz.Matrix(2, 2)
+        pix = p.get_pixmap(matrix=mat, alpha=False)
+        img_bytes = pix.tobytes("png")
+        try:
+            text = ocr_image_with_ocrspace(img_bytes, language=OCRSPACE_LANGUAGE)
+            ocr_lines.extend([ln.rstrip() for ln in text.splitlines()])
+        except HTTPException:
+            # keep going; we'll fallback later if all fail
+            continue
+        except Exception:
+            continue
+
+    if ocr_lines:
+        df = _lines_to_table_df(ocr_lines)
+        if df is not None and not df.empty:
+            return df
+        return pd.DataFrame({"text": ["\n".join(ocr_lines)]})
+
+    return pd.DataFrame({"note": ["No extractable content (text extraction empty; OCR failed or disabled)."]})
 
 
 # -----------------------------
 # Tools
 # -----------------------------
-
 @tool
 def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     """
@@ -122,7 +215,7 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     Fetches data from any URL: JSON, CSV, Excel, Parquet, DB files, archives, HTML tables, or dynamic JS-rendered pages.
     Returns a dictionary with status, data, and columns.
     """
-    import os, re, tempfile, requests, pandas as pd, duckdb
+    import duckdb
     from io import BytesIO, StringIO
     from bs4 import BeautifulSoup
 
@@ -161,7 +254,7 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
             tmp_path = tempfile.NamedTemporaryFile(delete=False).name
             with open(tmp_path, "wb") as f:
                 f.write(resp.content)
-            con = duckdb.connect(database=':memory:')
+            con = duckdb.connect(database=":memory:")
             con.execute(f"ATTACH '{tmp_path}' AS db")
             tables = con.execute("SHOW TABLES FROM db").fetchdf()
             if not tables.empty:
@@ -176,7 +269,7 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
             import tarfile, zipfile
             content = BytesIO(resp.content)
             if url.endswith(".zip"):
-                with zipfile.ZipFile(content, 'r') as z:
+                with zipfile.ZipFile(content, "r") as z:
                     for name in z.namelist():
                         if name.endswith(".parquet"):
                             df = pd.read_parquet(z.open(name))
@@ -203,25 +296,7 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Dynamic JS rendering
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.goto(url, timeout=45000)
-                page.wait_for_load_state("networkidle")
-                html = page.content()
-                browser.close()
-            tables = pd.read_html(StringIO(html), flavor="lxml")
-            if tables:
-                df = tables[0]
-                return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
-        except Exception:
-            pass
-
         # Plain text fallback
-        from bs4 import BeautifulSoup
         soup = BeautifulSoup(resp.text, "lxml")
         text = soup.get_text("\n", strip=True)
         return {"status": "success", "data": [{"text": text}], "columns": ["text"]}
@@ -230,33 +305,29 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
         return {"status": "error", "message": str(e)}
 
 
-
 # -----------------------------
 # Utilities for executing code safely
 # -----------------------------
-def clean_llm_output(output: str) -> Dict:
+def clean_llm_output(output: str) -> Dict[str, Any]:
     """
     Extract JSON object from LLM output robustly.
-    Returns dict or {"error": "…"}
+    Returns dict or {"error": "..."}
     """
     try:
         if not output:
             return {"error": "Empty LLM output"}
-        # remove triple-fence markers if present
         s = re.sub(r"^```(?:json)?\s*", "", output.strip())
         s = re.sub(r"\s*```$", "", s)
-        # find outermost JSON object by scanning for balanced braces
         first = s.find("{")
         last = s.rfind("}")
         if first == -1 or last == -1 or last <= first:
             return {"error": "No JSON object found in LLM output", "raw": s}
-        candidate = s[first:last+1]
+        candidate = s[first:last + 1]
         try:
             return json.loads(candidate)
         except Exception as e:
-            # fallback: try last balanced pair scanning backwards
             for i in range(last, first, -1):
-                cand = s[first:i+1]
+                cand = s[first:i + 1]
                 try:
                     return json.loads(cand)
                 except Exception:
@@ -265,19 +336,21 @@ def clean_llm_output(output: str) -> Dict:
     except Exception as e:
         return {"error": str(e)}
 
+
 SCRAPE_FUNC = r'''
 from typing import Dict, Any
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
+from io import StringIO
 
 def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     try:
         response = requests.get(
             url,
             headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5
+            timeout=10
         )
         response.raise_for_status()
     except Exception as e:
@@ -289,33 +362,28 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
         }
 
     soup = BeautifulSoup(response.text, "html.parser")
-    tables = pd.read_html(response.text)
+    try:
+        tables = pd.read_html(StringIO(response.text))
+    except Exception:
+        tables = []
 
     if tables:
-        df = tables[0]  # Take first table
+        df = tables[0]
         df.columns = [str(c).strip() for c in df.columns]
-        
-        # Ensure all columns are unique and string
         df.columns = [str(col) for col in df.columns]
-
         return {
             "status": "success",
             "data": df.to_dict(orient="records"),
             "columns": list(df.columns)
         }
     else:
-        # Fallback to plain text
         text_data = soup.get_text(separator="\n", strip=True)
-
-        # Try to detect possible "keys" from text like Runtime, Genre, etc.
         detected_cols = set(re.findall(r"\b[A-Z][a-zA-Z ]{2,15}\b", text_data))
-        df = pd.DataFrame([{}])  # start empty
+        df = pd.DataFrame([{}])
         for col in detected_cols:
             df[col] = None
-
         if df.empty:
             df["text"] = [text_data]
-
         return {
             "status": "success",
             "data": df.to_dict(orient="records"),
@@ -324,17 +392,11 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
 '''
 
 
-def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: int = 60) -> Dict[str, Any]:
+def write_and_run_temp_python(code: str, injected_pickle: Optional[str] = None, timeout: int = 60) -> Dict[str, Any]:
     """
-    Write a temp python file which:
-      - provides a safe environment (imports)
-      - loads df/from pickle if provided into df and data variables
-      - defines a robust plot_to_base64() helper that ensures < 100kB (attempts resizing/conversion)
-      - executes the user code (which should populate `results` dict)
-      - prints json.dumps({"status":"success","result":results})
-    Returns dict with parsed JSON or error details.
+    Write a temp python file that loads df/from pickle if provided, defines plot_to_base64(),
+    defines scrape_url_to_dataframe() (light version), then executes code that populates `results`.
     """
-    # create file content
     preamble = [
         "import json, sys, gc",
         "import pandas as pd, numpy as np",
@@ -344,17 +406,13 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
         "from io import BytesIO",
         "import base64",
     ]
-    if PIL_AVAILABLE:
-        preamble.append("from PIL import Image")
-    # inject df if a pickle path provided
+
     if injected_pickle:
         preamble.append(f"df = pd.read_pickle(r'''{injected_pickle}''')\n")
         preamble.append("data = df.to_dict(orient='records')\n")
     else:
-        # ensure data exists so user code that references data won't break
         preamble.append("data = globals().get('data', {})\n")
 
-    # plot_to_base64 helper that tries to reduce size under 100_000 bytes
     helper = r'''
 def plot_to_base64(max_bytes=100000):
     buf = BytesIO()
@@ -363,7 +421,6 @@ def plot_to_base64(max_bytes=100000):
     img_bytes = buf.getvalue()
     if len(img_bytes) <= max_bytes:
         return base64.b64encode(img_bytes).decode('ascii')
-    # try decreasing dpi/figure size iteratively
     for dpi in [80, 60, 50, 40, 30]:
         buf = BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=dpi)
@@ -371,62 +428,33 @@ def plot_to_base64(max_bytes=100000):
         b = buf.getvalue()
         if len(b) <= max_bytes:
             return base64.b64encode(b).decode('ascii')
-    # if Pillow available, try convert to WEBP which is typically smaller
-    try:
-        from PIL import Image
-        buf = BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', dpi=40)
-        buf.seek(0)
-        im = Image.open(buf)
-        out_buf = BytesIO()
-        im.save(out_buf, format='WEBP', quality=80, method=6)
-        out_buf.seek(0)
-        ob = out_buf.getvalue()
-        if len(ob) <= max_bytes:
-            return base64.b64encode(ob).decode('ascii')
-        # try lower quality
-        out_buf = BytesIO()
-        im.save(out_buf, format='WEBP', quality=60, method=6)
-        out_buf.seek(0)
-        ob = out_buf.getvalue()
-        if len(ob) <= max_bytes:
-            return base64.b64encode(ob).decode('ascii')
-    except Exception:
-        pass
-    # as last resort return downsized PNG even if > max_bytes
     buf = BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=20)
     buf.seek(0)
     return base64.b64encode(buf.getvalue()).decode('ascii')
 '''
 
-    # Build the code to write
-    script_lines = []
+    script_lines: List[str] = []
     script_lines.extend(preamble)
     script_lines.append(helper)
     script_lines.append(SCRAPE_FUNC)
     script_lines.append("\nresults = {}\n")
     script_lines.append(code)
-    # ensure results printed as json
     script_lines.append("\nprint(json.dumps({'status':'success','result':results}, default=str), flush=True)\n")
 
-    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
     tmp.write("\n".join(script_lines))
     tmp.flush()
     tmp_path = tmp.name
     tmp.close()
 
     try:
-        completed = subprocess.run([sys.executable, tmp_path],
-                                   capture_output=True, text=True, timeout=timeout)
+        completed = subprocess.run([sys.executable, tmp_path], capture_output=True, text=True, timeout=timeout)
         if completed.returncode != 0:
-            # collect stderr and stdout for debugging
-            return {"status": "error", "message": completed.stderr.strip() or completed.stdout.strip()}
-        # parse stdout as json
+            return {"status": "error", "message": (completed.stderr.strip() or completed.stdout.strip())}
         out = completed.stdout.strip()
         try:
-            parsed = json.loads(out)
-            return parsed
+            return json.loads(out)
         except Exception as e:
             return {"status": "error", "message": f"Could not parse JSON output: {str(e)}", "raw": out}
     except subprocess.TimeoutExpired:
@@ -440,36 +468,24 @@ def plot_to_base64(max_bytes=100000):
             pass
 
 
-
+# -----------------------------
 # LLM agent setup (safe, lazy default)
 # -----------------------------
-
 _GAPI = os.getenv("GOOGLE_API_KEY", "")
 
 llm = None
-agent = None
 agent_executor = None
 
-if _GAPI:
-    # Only build default Gemini if a key is present to avoid ADC fallback
-    llm = ChatGoogleGenerativeAI(
-        model=os.getenv("GOOGLE_MODEL", "gemini-2.5-pro"),
-        temperature=0,
-        api_key=_GAPI,  # IMPORTANT: use api_key (not google_api_key)
-    )
+tools = [scrape_url_to_dataframe]
 
-    # Tools list for agent (LangChain tool decorator returns metadata for the LLM)
-    tools = [scrape_url_to_dataframe]  # we only expose scraping as a tool; agent will still produce code
-
-    # Prompt: instruct agent to call the tool and output JSON only
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a full-stack autonomous data analyst agent.
+prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a full-stack autonomous data analyst agent.
 
 You will receive:
-- A set of **rules** for this request
-- One or more **questions**
-- An optional **dataset preview**
-- A `.txt` file that specifies the required JSON keys and their types.
+- A set of rules for this request
+- One or more questions
+- An optional dataset preview
+- A .txt file that specifies the required JSON keys and their types.
 
 You must:
 1. Follow the provided rules exactly.
@@ -478,199 +494,81 @@ You must:
    - "keys": [ list of output keys exactly as specified in the .txt file ]
    - "code": "..." (Python code that creates a dict called `results` with each output key as a key and its computed answer as the value)
 4. In your Python code, make sure the values are cast to the types specified in the .txt file:
-   - `number` → float
-   - `integer` / `int` → int
-   - `string` → str
-   - `bar_chart` / `plt` etc. → base64 PNG string under 100kB (use plot_to_base64()).
-5. Do not return the full question text as a key. Always use the JSON key specified in the `.txt`.
+   - number -> float
+   - integer/int -> int
+   - string -> str
+   - bar_chart/plt etc. -> base64 PNG string under 100kB (use plot_to_base64()).
+5. Do not return the full question text as a key. Always use the JSON key specified in the .txt.
 6. Always define variables before use. Code must run without errors.
 """),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
 
-    agent = create_tool_calling_agent(
-        llm=llm,
-        tools=[scrape_url_to_dataframe],
-        prompt=prompt
+if _GAPI:
+    llm = ChatGoogleGenerativeAI(
+        model=os.getenv("GOOGLE_MODEL", "gemini-2.5-pro"),
+        temperature=0,
+        api_key=_GAPI,
     )
-
+    agent = create_tool_calling_agent(llm=llm, tools=tools, prompt=prompt)
     agent_executor = AgentExecutor(
         agent=agent,
-        tools=[scrape_url_to_dataframe],
+        tools=tools,
         verbose=True,
         max_iterations=3,
         early_stopping_method="generate",
         handle_parsing_errors=True,
-        return_intermediate_steps=False
+        return_intermediate_steps=False,
     )
-else:
-    # Build prompt anyway so per-request agents can use it
-    tools = [scrape_url_to_dataframe]
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a full-stack autonomous data analyst agent.
-
-You will receive:
-- A set of **rules** for this request
-- One or more **questions**
-- An optional **dataset preview**
-- A `.txt` file that specifies the required JSON keys and their types.
-
-You must:
-1. Follow the provided rules exactly.
-2. Return only a valid JSON object — no extra commentary or formatting.
-3. The JSON must contain:
-   - "keys": [ list of output keys exactly as specified in the .txt file ]
-   - "code": "..." (Python code that creates a dict called `results` with each output key as a key and its computed answer as the value)
-4. In your Python code, make sure the values are cast to the types specified in the .txt file:
-   - `number` → float
-   - `integer` / `int` → int
-   - `string` → str
-   - `bar_chart` / `plt` etc. → base64 PNG string under 100kB (use plot_to_base64()).
-5. Do not return the full question text as a key. Always use the JSON key specified in the `.txt`.
-6. Always define variables before use. Code must run without errors.
-"""),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
 
 
 def make_llm(provider: str, model: str = "", api_key: str = ""):
-    """
-    Build a LangChain chat model for the chosen provider.
-    Falls back to env vars if api_key is empty.
-    """
     provider = (provider or "gemini").lower()
+
     if provider == "openai":
         if not HAS_LC_OPENAI:
             raise HTTPException(500, "OpenAI provider not installed (langchain-openai).")
-        return ChatOpenAI(
-            model=model or "gpt-4o-mini",
-            temperature=0,
-            api_key=api_key or os.getenv("OPENAI_API_KEY", "")
-        )
+        key = api_key or os.getenv("OPENAI_API_KEY", "")
+        if not key:
+            raise HTTPException(500, "OPENAI_API_KEY is required for OpenAI provider.")
+        return ChatOpenAI(model=model or "gpt-4o-mini", temperature=0, api_key=key)
 
     if provider == "claude":
         if not HAS_LC_ANTHROPIC:
             raise HTTPException(500, "Claude provider not installed (langchain-anthropic).")
-        return ChatAnthropic(
-            model=model or "claude-3-5-sonnet-20241022",
-            temperature=0,
-            api_key=api_key or os.getenv("ANTHROPIC_API_KEY", "")
-        )
+        key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
+        if not key:
+            raise HTTPException(500, "ANTHROPIC_API_KEY is required for Claude provider.")
+        return ChatAnthropic(model=model or "claude-3-5-sonnet-20241022", temperature=0, api_key=key)
 
     # default: Gemini
     gkey = api_key or os.getenv("GOOGLE_API_KEY", "")
     if not gkey:
-        raise HTTPException(500, "GOOGLE_API_KEY is required for Gemini (pass api_key or set env).")
+        raise HTTPException(500, "GOOGLE_API_KEY is required for Gemini provider.")
     return ChatGoogleGenerativeAI(
         model=model or os.getenv("GOOGLE_MODEL", "gemini-2.5-pro"),
         temperature=0,
-        api_key=gkey,  # IMPORTANT
+        api_key=gkey,
     )
 
 
 def build_agent_for(selected_llm):
-    """Create an AgentExecutor using your same prompt/tools."""
-    a = create_tool_calling_agent(
-        llm=selected_llm,
-        tools=[scrape_url_to_dataframe],
-        prompt=prompt
-    )
+    a = create_tool_calling_agent(llm=selected_llm, tools=tools, prompt=prompt)
     return AgentExecutor(
         agent=a,
-        tools=[scrape_url_to_dataframe],
+        tools=tools,
         verbose=True,
         max_iterations=3,
         early_stopping_method="generate",
         handle_parsing_errors=True,
-        return_intermediate_steps=False
+        return_intermediate_steps=False,
     )
 
-# -----------------------------
-# OCR helpers (images) and PDF via PyMuPDF
-# -----------------------------
-def _lines_to_table_df(lines: List[str]) -> pd.DataFrame | None:
-    """
-    Simple heuristic: split on 2+ spaces, keep rows with the modal column count.
-    """
-    rows = []
-    for line in lines:
-        s = line.strip()
-        if not s:
-            continue
-        parts = re.split(r"\s{2,}", s)
-        rows.append(parts)
-    if not rows:
-        return None
-    counts = {}
-    for r in rows:
-        counts[len(r)] = counts.get(len(r), 0) + 1
-    best_cols = max(counts, key=counts.get)
-    if best_cols < 2:
-        return None
-    filtered = [r for r in rows if len(r) == best_cols]
-    if len(filtered) < max(3, int(0.4 * len(rows))):
-        return None
-    header = None
-    maybe_header = filtered[0]
-    if len(set(maybe_header)) == len(maybe_header):
-        header = [str(c).strip() for c in maybe_header]
-    if header:
-        df = pd.DataFrame(filtered[1:], columns=header)
-    else:
-        df = pd.DataFrame(filtered)
-    df = df.apply(pd.to_numeric, errors="ignore")
-    return df
-
-def ocr_image_to_df(image_bytes: bytes) -> pd.DataFrame:
-    if not (PIL_AVAILABLE and PYTESS_AVAILABLE):
-        raise HTTPException(400, "OCR requires Pillow + pytesseract installed.")
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    text = pytesseract.image_to_string(image)
-    lines = [ln.rstrip() for ln in text.splitlines()]
-    df_tab = _lines_to_table_df(lines)
-    if df_tab is not None and not df_tab.empty:
-        return df_tab
-    return pd.DataFrame({"ocr_text": [text]})
-
-def pdf_to_dataframe_with_pymupdf(pdf_bytes: bytes) -> pd.DataFrame:
-    if not HAS_PYMUPDF:
-        raise HTTPException(400, "PyMuPDF (fitz) is required for PDF handling.")
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page_texts: List[str] = [p.get_text("text") for p in doc]
-    # OCR pass (render pages and OCR) if possible
-    ocr_lines: List[str] = []
-    if PIL_AVAILABLE and PYTESS_AVAILABLE:
-        for p in doc:
-            mat = fitz.Matrix(2, 2)
-            pix = p.get_pixmap(matrix=mat, alpha=False)
-            img_bytes = pix.tobytes("png")
-            try:
-                image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                text = pytesseract.image_to_string(image)
-                ocr_lines.extend([ln.rstrip() for ln in text.splitlines()])
-            except Exception:
-                continue
-    # try to reconstruct table first
-    if ocr_lines:
-        df = _lines_to_table_df(ocr_lines)
-        if df is not None and not df.empty:
-            return df
-    # fallback to text per page
-    if any(s.strip() for s in page_texts):
-        return pd.DataFrame({"page": list(range(1, len(page_texts)+1)), "text": page_texts})
-    # last resort: one big OCR blob
-    if ocr_lines:
-        return pd.DataFrame({"text": ["\n".join(ocr_lines)]})
-    return pd.DataFrame({"note": ["No extractable content"]})
 
 # -----------------------------
 # Runner: orchestrates agent -> pre-scrape inject -> execute
 # -----------------------------
-
-from fastapi import Request
-
 @app.post("/api")
 async def analyze_data(request: Request):
     try:
@@ -678,13 +576,12 @@ async def analyze_data(request: Request):
         questions_file = None
         data_file = None
 
-        # NEW: provider fields from UI (non-breaking; defaults to Gemini)
         provider = (form.get("provider") or "gemini").strip()
-        model    = (form.get("model") or "").strip()
-        api_key  = (form.get("api_key") or "").strip()
+        model = (form.get("model") or "").strip()
+        api_key = (form.get("api_key") or "").strip()
 
-        for key, val in form.items():
-            if hasattr(val, "filename") and val.filename:  # it's a file
+        for _, val in form.items():
+            if hasattr(val, "filename") and val.filename:
                 fname = val.filename.lower()
                 if fname.endswith(".txt") and questions_file is None:
                     questions_file = val
@@ -695,8 +592,8 @@ async def analyze_data(request: Request):
             raise HTTPException(400, "Missing questions file (.txt)")
 
         raw_questions = (await questions_file.read()).decode("utf-8")
-        
-        pickle_path = None
+
+        pickle_path: Optional[str] = None
         df_preview = ""
         dataset_uploaded = False
 
@@ -705,48 +602,43 @@ async def analyze_data(request: Request):
             filename = data_file.filename.lower()
             content = await data_file.read()
             from io import BytesIO
-            import duckdb, tempfile, tarfile, zipfile
+            import duckdb
+            import tarfile
+            import zipfile
 
-            df = None
-            duckdb_conn = duckdb.connect(database=':memory:')
+            df: Optional[pd.DataFrame] = None
+            duckdb_conn = duckdb.connect(database=":memory:")
 
-            # CSV
             if filename.endswith(".csv"):
                 df = pd.read_csv(BytesIO(content))
                 duckdb_conn.register("df", df)
 
-            # Excel
             elif filename.endswith((".xlsx", ".xls")):
                 df = pd.read_excel(BytesIO(content))
                 duckdb_conn.register("df", df)
-            
-            # NEW: PDF via PyMuPDF (no LLM)
-            elif filename.lower().endswith(".pdf"):
+
+            elif filename.endswith(".pdf"):
                 df = pdf_to_dataframe_with_pymupdf(content)
                 duckdb_conn.register("df", df)
 
-            # Parquet
             elif filename.endswith(".parquet"):
                 df = pd.read_parquet(BytesIO(content))
                 duckdb_conn.register("df", df)
 
-            # SQLite / DuckDB database
             elif filename.endswith(".db") or filename.endswith(".duckdb"):
                 tmp_path = tempfile.NamedTemporaryFile(delete=False).name
                 with open(tmp_path, "wb") as f:
                     f.write(content)
                 duckdb_conn.execute(f"ATTACH '{tmp_path}' AS uploaded_db")
-                # Pick the first table for df
                 tables = duckdb_conn.execute("SHOW TABLES FROM uploaded_db").fetchdf()
                 if not tables.empty:
                     first_table = tables.iloc[0, 0]
                     df = duckdb_conn.execute(f"SELECT * FROM uploaded_db.{first_table}").fetchdf()
 
-            # Archives (.tar.gz, .zip)
             elif filename.endswith((".tar.gz", ".tgz", ".tar", ".zip")):
                 content_io = BytesIO(content)
                 if filename.endswith(".zip"):
-                    with zipfile.ZipFile(content_io, 'r') as z:
+                    with zipfile.ZipFile(content_io, "r") as z:
                         for name in z.namelist():
                             if name.endswith(".parquet"):
                                 df = pd.read_parquet(z.open(name))
@@ -766,7 +658,6 @@ async def analyze_data(request: Request):
                 if df is not None:
                     duckdb_conn.register("df", df)
 
-            # JSON
             elif filename.endswith(".json"):
                 try:
                     df = pd.read_json(BytesIO(content))
@@ -774,21 +665,21 @@ async def analyze_data(request: Request):
                     df = pd.DataFrame(json.loads(content.decode("utf-8")))
                 duckdb_conn.register("df", df)
 
-            # NEW: Images via OCR
-            elif filename.lower().endswith((".png", ".jpg", ".jpeg")):
+            elif filename.endswith((".png", ".jpg", ".jpeg")):
                 df = ocr_image_to_df(content)
                 duckdb_conn.register("df", df)
 
             else:
                 raise HTTPException(400, f"Unsupported data file type: {filename}")
 
-            # Save pickle for LLM code injection
+            if df is None:
+                raise HTTPException(400, "Could not load dataset from uploaded file.")
+
             temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             temp_pkl.close()
             df.to_pickle(temp_pkl.name)
             pickle_path = temp_pkl.name
 
-            # Inject duckdb_conn into execution environment
             df_preview = (
                 f"\n\nThe uploaded dataset has {len(df)} rows and {len(df.columns)} columns.\n"
                 f"Columns: {', '.join(df.columns.astype(str))}\n"
@@ -796,7 +687,6 @@ async def analyze_data(request: Request):
                 f"You can also query the dataset using DuckDB via the variable `duckdb_conn`.\n"
             )
 
-        # Build rules based on data presence
         if dataset_uploaded:
             llm_rules = (
                 "Rules:\n"
@@ -815,15 +705,15 @@ async def analyze_data(request: Request):
             "Respond with the JSON object only."
         )
 
-        # NEW: Build per-request LLM + Agent (keeps your global Gemini default)
+        # Build per-request LLM + Agent (fallback to default gemini if available)
         try:
             selected_llm = make_llm(provider=provider, model=model, api_key=api_key)
-        except HTTPException as e:
-            # fall back to default Gemini if provider packages not installed
-            selected_llm = llm
-        agent_override = build_agent_for(selected_llm)
+            agent_override = build_agent_for(selected_llm)
+        except HTTPException:
+            if not agent_executor:
+                raise HTTPException(500, "No default Gemini agent available. Set GOOGLE_API_KEY or provide provider api_key.")
+            agent_override = agent_executor
 
-        # Run agent
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as ex:
             fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path, agent_override)
@@ -834,7 +724,7 @@ async def analyze_data(request: Request):
 
         if "error" in result:
             raise HTTPException(500, detail=result["error"])
-        print(result)
+
         return JSONResponse(content=result)
 
     except HTTPException as he:
@@ -844,23 +734,28 @@ async def analyze_data(request: Request):
         raise HTTPException(500, detail=str(e))
 
 
-def run_agent_safely_unified(llm_input: str, pickle_path: str = None, agent_override=None) -> Dict:
+def run_agent_safely_unified(llm_input: str, pickle_path: Optional[str] = None, agent_to_use=None) -> Dict[str, Any]:
     """
     Runs the LLM agent and executes code.
-    - Retries up to 3 times if agent returns no output.
+    - Retries if agent returns no output.
     - If pickle_path is provided, injects that DataFrame directly.
-    - If no pickle_path, falls back to scraping when needed.
+    - If no pickle_path, allows scraping tool injection if code calls it.
     """
     try:
         max_retries = 5
         raw_out = ""
-        # choose which agent to use
-        agent_to_use = agent_override or agent_executor
-        for attempt in range(1, max_retries + 1):
+
+        if agent_to_use is None:
+            if agent_executor is None:
+                return {"error": "No agent configured (missing GOOGLE_API_KEY and no provider api_key provided)."}
+            agent_to_use = agent_executor
+
+        for _ in range(max_retries):
             response = agent_to_use.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
             raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
             if raw_out:
                 break
+
         if not raw_out:
             return {"error": f"Agent returned no output after {max_retries} attempts"}
 
@@ -872,6 +767,7 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None, agent_over
             return {"error": f"Invalid agent response format: {parsed}"}
 
         code = parsed["code"]
+
         if pickle_path is None:
             urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
             if urls:
@@ -889,29 +785,22 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None, agent_over
         if exec_result.get("status") != "success":
             return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
 
-        results_dict = exec_result.get("result", {})
-        return results_dict
+        return exec_result.get("result", {})
 
     except Exception as e:
         logger.exception("run_agent_safely_unified failed")
         return {"error": str(e)}
 
 
-    
-from fastapi.responses import FileResponse, Response
-import base64, os
-
-# 1×1 transparent PNG fallback (if favicon.ico file not present)
+# -----------------------------
+# Favicon + health
+# -----------------------------
 _FAVICON_FALLBACK_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3n+9QAAAAASUVORK5CYII="
 )
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
-    """
-    Serve favicon.ico if present in the working directory.
-    Otherwise return a tiny transparent PNG to avoid 404s.
-    """
     path = "favicon.ico"
     if os.path.exists(path):
         return FileResponse(path, media_type="image/x-icon")
@@ -919,7 +808,6 @@ async def favicon():
 
 @app.get("/api", include_in_schema=False)
 async def analyze_get_info():
-    """Health/info endpoint. Use POST /api for actual analysis."""
     return JSONResponse({
         "ok": True,
         "message": "Server is running. Use POST /api with 'questions_file' and optional 'data_file'.",
