@@ -1,7 +1,6 @@
 
 
 import os
-import networkx as nx
 import re
 import json
 import base64
@@ -10,7 +9,6 @@ import sys
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 import io
 import os
 import re
@@ -42,7 +40,14 @@ except Exception:
     PIL_AVAILABLE = False
 
 from PIL import Image
-import pytesseract
+# OCR (optional)
+try:
+    import pytesseract
+    PYTESS_AVAILABLE = True
+except Exception:
+    pytesseract = None
+    PYTESS_AVAILABLE = False
+
 try:
     import cv2  # comes from opencv-python-headless
     CV2_AVAILABLE = True
@@ -90,14 +95,18 @@ app = FastAPI(title="TDS Data Analyst Agent")
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 180))
 
 
+from pathlib import Path
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
-    """Serve the main HTML interface"""
-    try:
-        with open("index.html", "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
-    except FileNotFoundError:
-        return HTMLResponse(content="<h1>Frontend not found</h1><p>Please ensure index.html is in the same directory as app.py</p>", status_code=404)
+    base_dir = Path(__file__).resolve().parent
+    html_path = base_dir / "index.html"
+    if not html_path.exists():
+        return HTMLResponse(
+            content="<h1>Frontend not found</h1><p>index.html is missing.</p>",
+            status_code=404
+        )
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
 
